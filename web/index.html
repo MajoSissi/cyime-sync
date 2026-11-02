@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="cyime-token" content="__CYIME_TOKEN__">
+<meta name="cyime-local" content="__CYIME_LOCAL__">
+<title>CyIME 剪贴板同步</title>
+<link rel="icon" href="/icon-64.png" type="image/png" sizes="64x64">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="stylesheet" href="/md3.css">
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<div class="banner" id="remoteBanner" hidden>远程查看模式 · 仅本机可修改</div>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand__mark" src="/icon-64.png" alt="" width="32" height="32">
+      <h1>CyIME</h1>
+    </div>
+
+    <div class="topbar__actions">
+      <span class="pill" id="statusPill" data-state="on"><i></i><span id="statusText">同步中</span></span>
+      <button class="switch" id="masterSwitch" role="switch" aria-checked="true" aria-label="启用同步">
+        <span class="switch__track"><span class="switch__thumb"></span></span>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <div class="column">
+
+      <section class="card card--connect" aria-labelledby="connectTitle">
+        <h2 class="sr-only" id="connectTitle">连接</h2>
+
+        <figure class="qr">
+          <img id="qr" class="qr__img" alt="扫码连接二维码" width="172" height="172">
+          <figcaption class="qr__foot">
+            <span id="qrExpiry">—</span>
+            <button class="text-btn" id="refreshQR" title="重新生成二维码，旧码立即失效">刷新</button>
+          </figcaption>
+        </figure>
+
+        <div class="pair">
+          <div class="pair__head">
+            <span class="label" id="devicesLabel">已连接设备</span>
+            <span class="pair__count" id="devicesCount"></span>
+          </div>
+          <div class="devices-wrap" id="devicesWrap">
+            <div class="devices" id="devices" aria-labelledby="devicesLabel"></div>
+          </div>
+          <p class="devices__empty" id="devicesEmpty">用 CyIME 扫描二维码</p>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="syncTitle">
+        <h2 id="syncTitle">同步</h2>
+        <div class="row">
+          <label class="row__label" for="maxCharsInput" title="中文、英文都按 1 个字符计；超过上限的内容不会自动推到手机">推送字符上限</label>
+          <input class="input" id="maxCharsInput" type="number" min="1" max="100000" step="100" inputmode="numeric" spellcheck="false">
+        </div>
+        <div class="row">
+          <label class="row__label" for="forceCharsInput" title="托盘菜单「推送当前剪贴板」时使用，比常规上限宽松；中英文都按 1 个字符计">强制推送上限</label>
+          <input class="input" id="forceCharsInput" type="number" min="1" max="100000" step="500" inputmode="numeric" spellcheck="false">
+        </div>
+        <div class="row">
+          <span class="row__label" title="4-8 位纯数字短文本按短信验证码处理，不送到手机；密码管理器声明为私密的内容始终跳过">跳过疑似验证码</span>
+          <button class="switch" id="skipOTP" role="switch" aria-checked="true" aria-label="跳过疑似验证码">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+          </button>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="svcTitle">
+        <h2 id="svcTitle">服务</h2>
+        <div class="row">
+          <label class="row__label" for="portInput" title="修改后需用新地址重新打开设置页">端口</label>
+          <input class="input" id="portInput" type="number" min="1" max="65535" inputmode="numeric" spellcheck="false">
+        </div>
+        <div class="row">
+          <label class="row__label" for="listenSelect" title="手机只能连接这里绑定到的地址">网卡</label>
+          <select class="input" id="listenSelect"></select>
+        </div>
+        <div class="row">
+          <span class="row__label" title="开机时自动启动并驻留托盘">开机自启动</span>
+          <button class="switch" id="autoStart" role="switch" aria-checked="false" aria-label="开机自启动">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+          </button>
+        </div>
+        <p class="error" id="listenError" hidden></p>
+      </section>
+
+    </div>
+
+    <aside class="rail">
+      <section class="card card--events" aria-labelledby="evTitle">
+        <div class="card__head">
+          <h2 id="evTitle">事件</h2>
+          <div class="card__head-actions">
+            <button class="text-btn" id="clearEvents">清空</button>
+          </div>
+        </div>
+        <div class="events" id="events" role="log" aria-live="polite">
+          <p class="empty" id="emptyState">暂无记录</p>
+        </div>
+      </section>
+    </aside>
+
+  </main>
+
+</div>
+
+<div class="snackbar" id="snackbar" role="status" aria-live="polite" hidden></div>
+
+<template id="eventRow">
+  <div class="event">
+    <div class="event__line">
+      <span class="event__time"></span>
+      <span class="event__dir"></span>
+      <span class="event__status"></span>
+      <span class="event__meta"></span>
+    </div>
+    <p class="event__note"></p>
+    <p class="event__preview"></p>
+  </div>
+</template>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

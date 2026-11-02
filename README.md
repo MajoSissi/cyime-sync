@@ -1,1 +1,173 @@
-# cyime-sync
+# CyIME Sync
+
+Windows 上的**剪贴板同步电脑端**，与 CyIME 输入法「手机与电脑互联」配合，双向同步纯文本。
+
+- **扫码配对**：手机扫设置页二维码即完成配对，走 TLS + 逐设备令牌，不再需要手填地址或配对码。
+- 单文件 `cyime-sync.exe`，无安装器、无运行时依赖、无需管理员权限、`CGO_ENABLED=0`。
+- 常驻通知区域；**双击托盘图标**用默认浏览器打开内置设置页。
+- 托盘右键可直接**推送当前剪贴板**：忽略常规字符上限，改用更宽松的「强制推送上限」。
+- 设置页与接口由进程内 `net/http` 提供，静态资源 `go:embed` 打包，断网可用。
+- 明文 HTTP（本机设置页）与 HTTPS（手机端）共用**同一个端口**，按连接首字节分流。
+- **绿色部署**：配置、证书、日志全部在 exe 同级的 `data/` 目录内，整个目录拷走即可迁移。
+
+## 快速开始
+
+```bash
+# 构建（Windows），产物统一放在 build/
+go build -trimpath -ldflags "-s -w -H windowsgui" -o build/cyime-sync.exe .
+
+# 运行
+./build/cyime-sync.exe
+```
+
+启动后双击托盘图标打开设置页（默认 <http://127.0.0.1:18740>）。
+`build/` 已在 `.gitignore` 里，产物与运行期数据都不会进版本库。
+图标资源已随仓库提供（`rsrc_windows_amd64.syso` 负责 exe 文件图标，`internal/tray/icon.ico` 负责托盘），`go build` 直接可用，无需额外工具链。
+
+## 数据目录
+
+所有运行期数据都在 exe 同级的 `data/` 下（即 `build/data/`）：
+
+```
+build/
+├── cyime-sync.exe
+└── data/
+    ├── config.json          # 全部设置、本机标识、已配对设备（只存令牌哈希与备注）
+    ├── tls/
+    │   ├── cert.pem         # 自签 ECDSA 证书，手机按指纹固定信任
+    │   └── key.pem
+    └── logs/
+        ├── cyime-sync.log   # 当前日志
+        └── cyime-sync.1.log # 轮转历史，最多 3 份
+```
+
+- 日志单文件上限 **1 MiB**，写满即轮转，最多保留 4 个文件；超过 **7 天**的历史文件在启动时与运行中每 6 小时清理一次。
+- `data/` 目录不可写时（例如放在 `Program Files` 且无权限），退化到 `%APPDATA%\CyIMESync\data\`。
+- 首次启动若发现旧版数据在 `%APPDATA%\CyIMESync\`，会自动把 `config.json` 与 `tls/` 复制过来（旧目录保留，不删除），已配对的手机会继续有效。
+
+## 手机端怎么连
+
+1. 设置页左侧「连接」卡片显示二维码（2 分钟有效，到期自动换新；也可点「刷新」立即作废旧码重发）。
+2. 手机上打开 CyIME 设置 →「手机与电脑互联」→「扫码连接」，对准二维码。
+3. 配对成功后手机出现在「已连接设备」里，可随时「断开」；点铅笔图标可给设备起备注（如「工作机」），同型号手机也能分清。
+
+二维码内容是 `cyime://pair?v=2&c=…`（紧凑二进制，内含地址、证书指纹与一次性密钥），
+不是网址；用普通扫码 App 扫只会看到一串编码，需要由 CyIME 自己解析。
+
+## 安全须知
+
+- **连接已加密**：TLS 1.2+，自签 ECDSA 证书，手机端按证书指纹固定信任；每台设备一次性令牌，可单独撤销。
+  证书指纹随 `data/tls` 删除而改变，届时需重新扫码。
+- 二维码内含一次性配对密钥，只在设置页凭本机令牌获取，不写日志、不落盘。
+- 默认监听 `0.0.0.0:18740`；不需要手机访问时可把「网卡」改成「仅本机」。
+- 设置接口（改配置、看事件）只对 `127.0.0.1` 开放，并要求一次性本地令牌 + 同源校验。
+- 事件流只保存元数据；正文预览只在内存里保留头尾（单行、最多 160 字符），不落盘。
+- 剪贴板正文不进日志，日志只记录启动、监听、配对、错误等元数据。
+- **敏感判定只作用于「电脑 → 手机」**：密码管理器声明为私密的内容、疑似验证码不会推到手机。反方向（手机推来的内容）不做判定，会照常写入剪贴板并出现在事件预览里。
+- **同步来的内容未声明「不进历史」**：如果开启了 Windows 剪贴板历史（Win+V），手机推来的内容会被系统留存。敏感内容请勿通过手机推送。
+- 超过「推送字符上限」（默认 1000 字符，中英文都按 1 个字符计）的文本不会自动推到手机。
+- 托盘右键「推送当前剪贴板」是手动操作，使用更宽松的「强制推送上限」（默认 10000 字符）；超过该上限仍会被拒绝，敏感内容也照旧跳过。
+- 不读系统凭据、不改防火墙、不做 UDP 广播发现。
+
+## 协议摘要
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| `GET` | `/api/clipboard` | 读取电脑当前剪贴板文本（需 `Bearer <设备令牌>`） |
+| `PUT` | `/api/clipboard` | 手机推送文本，写入电脑剪贴板 |
+| `GET` | `/api/qr.png?token=…` | 本机设置页取配对二维码（含一次性密钥，需本地令牌） |
+| `POST` | `/api/pairing` | 本机设置页取配对窗口状态；带 `?rotate=1` 时作废旧码换新码 |
+| `POST` | `/api/pair` | 手机用二维码里的 `pairing_id` + `secret` 换令牌，成功 `201` |
+| `GET` | `/api/status` | 带 `Bearer` 时返回 `{"v":2,…}`；否则返回本机运行状态 |
+| `PATCH` | `/api/devices?id=…` | 本机设置页改设备备注（`{"note":"工作机"}`） |
+| `DELETE` | `/api/devices?id=…` | 本机设置页断开设备，令牌立即失效 |
+
+| 状态 | 触发条件 |
+|---|---|
+| `200` | 成功；PUT 的响应回显与请求相同的 `hash` |
+| `204` | 剪贴板为空、非文本（图片、文件），或文本超过推送字符上限 |
+| `304` | GET 带 `If-None-Match` 且内容未变 |
+| `400` | 请求体非法（非 JSON、字段缺失、size/hash 不符） |
+| `401` | 设备令牌缺失、无效或已撤销 |
+| `409` | 写入前剪贴板被其它进程改变（CAS 失败），或设备数达上限 |
+| `413` | 文本超过 64 KiB |
+| `503` | 剪贴板被占用，或电脑端已停用同步 |
+| `410` | 配对窗口未打开或已过期 |
+
+响应体：
+
+```json
+{"type":"text","text":"内容","size":123,"hash":"<sha256-hex>","source":"cyime-windows","has_data":false}
+```
+
+`size` 与 `hash` 由服务端重新计算，不信任客户端传入值；响应不含 `data_name`。
+完整字节布局与配对状态码见 `AGENTS.md` §3。
+
+## 设置项
+
+| 文件字段 | 界面 | 说明 |
+|---|---|---|
+| `enabled` | 顶部开关 | 关闭后 `/api/clipboard` 返回 503，设置页仍可访问 |
+| `listen_address` | 网卡 | `0.0.0.0` 全部网卡；也可只绑某块网卡或 `127.0.0.1` |
+| `port` | 端口 | 默认 `18740`，改端口后需用新地址重开设置页 |
+| `max_push_chars` | 推送字符上限 | 默认 `1000`，范围 1–100000；超过上限的文本不自动推送，事件里标「超长跳过」 |
+| `force_push_chars` | 强制推送上限 | 默认 `10000`，范围 1–100000；托盘菜单「推送当前剪贴板」使用，超过仍拒绝 |
+| `skip_suspected_otp` | 跳过疑似验证码 | 默认开启；4–8 位纯数字短文本按验证码处理，不推送。关闭后这类内容正常同步 |
+| `auto_start` | 开机自启动 | 写 `HKCU\...\CurrentVersion\Run`，默认关闭 |
+| `server_id` | — | 本机稳定标识，二维码内 `server_id` |
+| `devices[].note` | 设备备注 | 用户自定义，最长 32 字符；为空时显示手机型号 |
+| `devices` | 已连接设备 | 已配对设备，只保存令牌 SHA-256 |
+
+同步方向恒为双向、事件预览恒开，因此不再有 `allow_outbound` / `allow_inbound` / `show_preview` 三个字段（旧配置升级时自动丢弃）。
+
+「跳过疑似验证码」只控制**本程序的形态猜测**（4–8 位纯数字，也可能是订单号、工号、邮编）。密码管理器等来源自己声明的隐私标记（`ExcludeClipboardContentFromMonitorProcessing`、`CanUploadToCloudClipboard=0` 等）表达的是来源的明确意图，**任何设置都无法放行**。
+
+## 验证
+
+```bash
+go vet ./...     # 静态检查（含 unsafe.Pointer 使用）
+go test ./...    # 协议 / 配置 / 日志 / 引擎 / 配对 / HTTP 层
+go build -trimpath -ldflags "-s -w -H windowsgui" -o build/cyime-sync.exe .
+```
+
+本地回环手工验收（`$TOKEN` 为设置页 meta 里的本地令牌）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18740/api/clipboard      # 401（缺令牌）
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:18740/api/qr.png"       # 403（缺本地令牌）
+curl -s -o /tmp/qr.png "http://127.0.0.1:18740/api/qr.png?token=$TOKEN"           # 200 image/png
+echo | openssl s_client -connect 127.0.0.1:18740 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+curl -s -H "X-Cyime-Token: $TOKEN" http://127.0.0.1:18740/api/pairing              # 窗口剩余秒数 + 设备列表
+curl -s -H "X-Cyime-Token: $TOKEN" http://127.0.0.1:18740/api/settings             # 两个上限默认 1000 / 10000
+```
+
+托盘菜单只能人手验证：右键应只有 打开设置 / 推送当前剪贴板 / 退出；「推送当前剪贴板」对超过常规上限的文本应产生「已同步 · 已强制推送」事件。
+
+## 目录
+
+```
+main.go              # 装配：数据目录、日志、单实例、配置、托盘、HTTP、同步引擎
+internal/appdir/     # data/ 目录定位、可写探测、旧版数据迁移
+internal/logging/    # 按大小轮转的日志写入 + 超期清理
+internal/config/     # 配置结构、原子落盘、字段修复、server_id 与设备记录
+internal/clipboard/  # Win32 剪贴板读写（序列号、重试、CAS、敏感格式）
+internal/protocol/   # profile 编解码、摘要、ETag、错误码
+internal/pairing/    # 配对：自签证书、限时窗口、逐设备令牌、紧凑二维码
+internal/syncer/     # 变化检测、自写抑制、事件环形缓冲
+internal/server/     # 协议端点、设置、状态、SSE、同端口 TLS 分流
+internal/tray/       # 窗口类、消息循环、托盘图标、菜单
+internal/winutil/    # 懒加载 Win32 绑定、DPI、自启动、本机地址
+web/                 # 设置页（go:embed），含页面图标 icon-64/180.png
+img/                 # 品牌图标源文件（logo-512x512.png 为唯一母版）
+rsrc_windows_amd64.syso  # 由 logo.ico 生成的 exe 文件图标资源
+build/               # 构建产物与运行期数据（.gitignore）
+```
+
+图标只有一份母版 `img/logo-512x512.png`：`internal/tray/icon.ico`、`web/icon-64.png`、
+`web/icon-180.png` 与 `rsrc_windows_amd64.syso` 都是它的派生文件，换图标时四者一起重生成。
+
+## 非目标
+
+附近发现（mDNS `_cyime-clip._tcp.`）与连接码确认（`/api/pair/nearby`）、
+旧版明文插件（协议 v1）兼容、剪贴板历史、图片与文件同步、多设备广播、
+输入法功能本身、安装器与服务注册、Linux/macOS 移植。

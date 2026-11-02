@@ -1,0 +1,16 @@
+# 构建产物
+/build/
+/dist/
+*.exe
+
+# 运行期数据：配置、证书、日志（由程序在 exe 同级 data/ 下自动生成）
+/data/
+/data-*/
+
+# 编辑器与系统杂项
+.workbuddy/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
