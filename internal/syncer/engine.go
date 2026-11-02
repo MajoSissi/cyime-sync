@@ -48,6 +48,13 @@ type Engine struct {
 	etag    string
 	lastSeq uint32
 	selfSeq uint32
+	// forceHash 是最近一次手动推送成功的内容 hash。同一段内容再被观测到时继续放行：
+	// 序列号会因「其它程序重设了同一段内容」而变化，不能因此把用户刚强推的内容撤下。
+	forceHash string
+	// seenHash / seenStatus 是上一次观测的内容与判定结果，用于跨轮次去重：
+	// 序列号变化但内容和结论都没变时，不重复记事件。
+	seenHash   string
+	seenStatus string
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -156,7 +163,7 @@ type Result struct {
 // ErrDisabled 表示同步已停用：托盘与接口层据此提示用户先启用。
 var ErrDisabled = errors.New("同步已停用")
 
-// ForcePush 立即按「强制上限」推送一次当前剪贴板，忽略常规推送上限。
+// ForcePush 立即按「手动推送上限」推送一次当前剪贴板，忽略常规推送上限。
 //
 // 只放宽长度限制：敏感内容（密码管理器声明、疑似验证码）仍然跳过。强制推送表达的是
 // "我现在就要发这一段"，不是"允许把隐私内容发出去"。
@@ -187,16 +194,16 @@ func (e *Engine) ForcePush() (Result, error) {
 	}
 
 	limit := e.forceLimit()
-	if limit > 0 && utf8.RuneCountInString(snap.Text) > limit {
+	if note := e.oversizeNote(limit, snap.Text, true); note != "" {
 		e.clearCache(snap.Seq)
 		meta.Preview = previewText(snap.Text)
-		e.record(meta, StatusOversize, fmt.Sprintf("超过强制上限 %d 字符，未推送", limit))
+		e.record(meta, StatusOversize, note)
 		return Result{Status: StatusOversize}, nil
 	}
 
-	etag := e.commitCache(snap.Seq, snap.Text, false)
+	etag := e.forceCommit(snap.Seq, snap.Text)
 	meta.Preview = previewText(snap.Text)
-	e.record(meta, StatusSynced, "已强制推送")
+	e.record(meta, StatusSynced, "已手动推送")
 	return Result{ETag: etag, Status: StatusSynced}, nil
 }
 
@@ -243,6 +250,10 @@ func (e *Engine) Apply(text, source string) (Result, error) {
 	}
 
 	etag := e.commitCache(newSeq, text, true)
+	e.mu.Lock()
+	// 手机写进来的内容不继承电脑端某段内容的"手动放行"。
+	e.forceHash = ""
+	e.mu.Unlock()
 	e.record(meta, StatusSynced, "")
 	return Result{ETag: etag, Status: StatusSynced}, nil
 }
@@ -252,14 +263,33 @@ func (e *Engine) MarkInvalid(direction, source, note string) {
 	e.record(Event{Direction: direction, Source: source}, StatusInvalid, note)
 }
 
+// oversizeNote 判断一段文本为什么不能推出，返回空串表示可以推。
+//
+// 顺序固定：先看协议硬上限（64 KiB，手机端同样按这个数拒绝，强推也突破不了），
+// 再看本地配置的字符上限。force 用于区分「手动推送上限」与常规上限的文案。
+func (e *Engine) oversizeNote(limit int, text string, force bool) string {
+	if len(text) > protocol.MaxTextBytes {
+		return fmt.Sprintf("超过协议上限 %d KiB，手机端无法接收", protocol.MaxTextBytes/1024)
+	}
+	if limit > 0 && utf8.RuneCountInString(text) > limit {
+		if force {
+			return fmt.Sprintf("超过手动推送上限 %d 字符，未推送", limit)
+		}
+		return fmt.Sprintf("超过 %d 字符上限，未推送", limit)
+	}
+	return ""
+}
+
 // commitCache 更新缓存；selfWrite 为真时登记自写序列号以抑制回环事件。
 func (e *Engine) commitCache(seq uint32, text string, selfWrite bool) string {
 	etag := protocol.ETag(text)
+	_, hash := protocol.Digest(text)
 	e.mu.Lock()
 	e.kind = clipboard.KindText
 	e.text = text
 	e.etag = etag
 	e.lastSeq = seq
+	e.seenHash, e.seenStatus = hash, StatusSynced
 	if selfWrite {
 		e.selfSeq = seq
 	}
@@ -273,7 +303,27 @@ func (e *Engine) clearCache(seq uint32) {
 	e.kind = clipboard.KindEmpty
 	e.text, e.etag = "", ""
 	e.lastSeq = seq
+	// 没有可推送的内容时，上一次手动推送的放行也一并作废。
+	e.forceHash = ""
 	e.mu.Unlock()
+}
+
+// forceCommit 写入手动推送的内容，并在同一把锁里登记放行标记。
+//
+// 两步必须原子完成：若先写缓存再登记放行，轮询可能恰好插在中间，看到"缓存里有超长
+// 内容、却没有放行标记"，于是立刻把它撤下——用户刚点的推送就白做了。
+func (e *Engine) forceCommit(seq uint32, text string) string {
+	etag := protocol.ETag(text)
+	_, hash := protocol.Digest(text)
+	e.mu.Lock()
+	e.kind = clipboard.KindText
+	e.text = text
+	e.etag = etag
+	e.lastSeq = seq
+	e.seenHash, e.seenStatus = hash, StatusSynced
+	e.forceHash = hash
+	e.mu.Unlock()
+	return etag
 }
 
 func (e *Engine) watch() {
@@ -335,15 +385,14 @@ func (e *Engine) poll() {
 		e.text = ""
 		e.etag = ""
 		e.lastSeq = snap.Seq
+		e.seenHash, e.seenStatus = "", ""
 		e.mu.Unlock()
 		e.record(Event{Direction: DirOut, Source: protocol.SourceDesktop, Bytes: len(snap.Text)},
 			StatusSensitive, "已跳过同步："+snap.SensitiveReason)
 
 	case snap.Kind == clipboard.KindText:
-		e.mu.RLock()
-		same := e.text == snap.Text
-		e.mu.RUnlock()
 		_, hash := protocol.Digest(snap.Text)
+
 		ev := Event{
 			Direction: DirOut,
 			Source:    protocol.SourceDesktop,
@@ -352,11 +401,19 @@ func (e *Engine) poll() {
 			Preview:   previewText(snap.Text),
 		}
 		limit := e.pushLimit()
-		oversize := limit > 0 && utf8.RuneCountInString(snap.Text) > limit
 
 		e.mu.Lock()
+		// 放行状态在写锁内确认：读剪贴板与这里之间可能刚有人点了托盘「推送」。
+		// 手动推送过的同一段内容不再按常规字符上限拦截——否则系统或其它程序把剪贴板
+		// 原地重设一次（序列号变了、内容没变），刚强推的内容就会被立刻撤下。
+		// 协议硬上限（64 KiB）不因强推而放宽：那是手机端的接收上限。
+		forced := e.forceHash != "" && e.forceHash == hash
+		oversize := len(snap.Text) > protocol.MaxTextBytes ||
+			(limit > 0 && utf8.RuneCountInString(snap.Text) > limit && !forced)
+		status := StatusSynced
 		if oversize {
 			// 超长内容不进缓存：GET 返回 204，手机端保持原样，不会被大段文本卡住。
+			status = StatusOversize
 			e.kind = clipboard.KindEmpty
 			e.text, e.etag = "", ""
 		} else {
@@ -365,22 +422,34 @@ func (e *Engine) poll() {
 			e.etag = protocol.ETag(snap.Text)
 		}
 		e.lastSeq = snap.Seq
+		repeat := e.seenHash == hash && e.seenStatus == status
+		e.seenHash, e.seenStatus = hash, status
+		if !forced {
+			// 内容换了，上一次手动推送的放行随之作废。
+			e.forceHash = ""
+		}
 		e.mu.Unlock()
 
+		// 同样的内容、同样的结论：不再重复记一条（剪贴板序列号会被反复推高）。
+		if repeat {
+			return
+		}
 		switch {
 		case oversize:
-			e.record(ev, StatusOversize, fmt.Sprintf("超过 %d 字符上限，未推送", limit))
-		case !same:
+			e.record(ev, StatusOversize, e.oversizeNote(limit, snap.Text, false))
+		default:
 			e.record(ev, StatusSynced, "")
 		}
 
 	default:
 		// 空剪贴板 / 图片 / 文件：不产生事件，但缓存必须失效。
+		// 去重标记一并清掉：内容离开过剪贴板，再复制回同样的文字算一次新推送。
 		e.mu.Lock()
 		e.kind = snap.Kind
 		e.text = ""
 		e.etag = ""
 		e.lastSeq = snap.Seq
+		e.seenHash, e.seenStatus = "", ""
 		e.mu.Unlock()
 	}
 }
@@ -397,11 +466,36 @@ func (e *Engine) refresh(recordSensitive bool) {
 		seq = e.clip.Sequence()
 	}
 	limit := e.pushLimit()
-	oversize := snap.Kind == clipboard.KindText && limit > 0 && utf8.RuneCountInString(snap.Text) > limit
+	hash := ""
+	if snap.Kind == clipboard.KindText {
+		_, hash = protocol.Digest(snap.Text)
+	}
+	e.mu.Lock()
+	// 与 poll 一致：放行状态与读到的内容在同一把锁内比对。
+	forced := hash != "" && e.forceHash != "" && e.forceHash == hash
+	// 手动推送只放宽本地字符上限；协议 64 KiB 硬上限不放宽（手机端同样按它拒绝）。
+	bytesOver := snap.Kind == clipboard.KindText && len(snap.Text) > protocol.MaxTextBytes
+	charsOver := snap.Kind == clipboard.KindText && limit > 0 && utf8.RuneCountInString(snap.Text) > limit
+	oversize := bytesOver || (charsOver && !forced)
 	skip := e.shouldSkip(snap)
 
-	e.mu.Lock()
+	status := StatusSynced
+	if oversize {
+		status = StatusOversize
+	}
+
 	e.lastSeq = seq
+	repeat := hash != "" && e.seenHash == hash && e.seenStatus == status
+	if hash != "" {
+		e.seenHash, e.seenStatus = hash, status
+	} else if snap.Kind != clipboard.KindText {
+		// 非文本/空：内容已离开剪贴板，去重标记作废。
+		e.seenHash, e.seenStatus = "", ""
+	}
+	if snap.Kind == clipboard.KindText && !forced {
+		// 内容换了，上一次手动推送的放行随之作废。
+		e.forceHash = ""
+	}
 	switch {
 	case skip, oversize:
 		e.kind = clipboard.KindEmpty
@@ -421,9 +515,9 @@ func (e *Engine) refresh(recordSensitive bool) {
 			StatusSensitive, "已跳过同步："+snap.SensitiveReason)
 		return
 	}
-	if oversize {
+	if oversize && !repeat {
 		e.record(Event{Direction: DirOut, Source: protocol.SourceDesktop, Bytes: len(snap.Text),
-			Preview: previewText(snap.Text)}, StatusOversize, fmt.Sprintf("超过 %d 字符上限，未推送", limit))
+			Preview: previewText(snap.Text)}, StatusOversize, e.oversizeNote(limit, snap.Text, false))
 	}
 }
 

@@ -119,7 +119,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("推送字符上限需在 %d-%d 之间，当前为 %d", MinPushChars, MaxPushChars, c.MaxPushChars)
 	}
 	if c.ForcePushChars < MinPushChars || c.ForcePushChars > MaxPushChars {
-		return fmt.Errorf("强制推送字符上限需在 %d-%d 之间，当前为 %d", MinPushChars, MaxPushChars, c.ForcePushChars)
+		return fmt.Errorf("手动推送字符上限需在 %d-%d 之间，当前为 %d", MinPushChars, MaxPushChars, c.ForcePushChars)
 	}
 	return ValidateListenAddress(c.ListenAddress)
 }
@@ -249,10 +249,10 @@ func normalize(c *Config) []string {
 	}
 	if c.ForcePushChars == 0 {
 		c.ForcePushChars = DefaultForcePushChars
-		issues = append(issues, "强制推送字符上限缺失，已重置为默认值")
+		issues = append(issues, "手动推送字符上限缺失，已重置为默认值")
 	} else if c.ForcePushChars < MinPushChars || c.ForcePushChars > MaxPushChars {
 		c.ForcePushChars = min(max(c.ForcePushChars, MinPushChars), MaxPushChars)
-		issues = append(issues, "强制推送字符上限超出范围，已修正")
+		issues = append(issues, "手动推送字符上限超出范围，已修正")
 	}
 	if len(c.Devices) > MaxDevices {
 		c.Devices = c.Devices[:MaxDevices]

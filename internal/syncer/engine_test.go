@@ -297,8 +297,109 @@ func TestForcePushBypassesNormalLimit(t *testing.T) {
 		t.Fatalf("强制推送后缓存不符: kind=%v len=%d", kind, len(text))
 	}
 	last, _ = ring.Last()
-	if last.Status != StatusSynced || last.Note != "已强制推送" {
+	if last.Status != StatusSynced || last.Note != "已手动推送" {
 		t.Fatalf("应记录强制推送事件，实际 %+v", last)
+	}
+}
+
+// 手动推送之后，同一段内容被别的程序「原地重设」（序列号变了、内容没变）时，
+// 不能又被常规上限撤下：否则手机下一次 GET 拿到 204，用户看到的就是「强推了却没同步」。
+func TestForcePushStaysAvailableAfterSequenceBump(t *testing.T) {
+	long := strings.Repeat("中", 1500)
+	e, clip, ring := newEngine(t, long)
+	e.SetPushLimitFunc(func() int { return 1000 })
+	e.SetForceLimitFunc(func() int { return 10000 })
+
+	e.Refresh() // 先按常规上限撤下缓存
+	if _, _, kind := e.Current(); kind == clipboard.KindText {
+		t.Fatal("前置条件：超长内容初始不应在缓存里")
+	}
+	if _, err := e.ForcePush(); err != nil {
+		t.Fatalf("强制推送失败: %v", err)
+	}
+
+	if _, err := clip.Write(long, 0); err != nil { // 内容相同，序列号推进
+		t.Fatal(err)
+	}
+	before := len(ring.List())
+	e.poll()
+
+	text, _, kind := e.Current()
+	if kind != clipboard.KindText || text != long {
+		t.Fatalf("同一段内容再次被观测后不应撤下缓存: kind=%v len=%d", kind, len(text))
+	}
+	if after := len(ring.List()); after != before {
+		t.Fatalf("内容与结论都没变，不应重复记事件（新增 %d 条）", after-before)
+	}
+}
+
+// 剪贴板换成另一段超长内容后，之前的手动放行必须失效。
+func TestForcePushReleasesWhenClipboardChanges(t *testing.T) {
+	long := strings.Repeat("中", 1500)
+	other := strings.Repeat("文", 1500)
+	e, clip, ring := newEngine(t, long)
+	e.SetPushLimitFunc(func() int { return 1000 })
+	e.SetForceLimitFunc(func() int { return 10000 })
+
+	if _, err := e.ForcePush(); err != nil {
+		t.Fatalf("强制推送失败: %v", err)
+	}
+	if _, err := clip.Write(other, 0); err != nil {
+		t.Fatal(err)
+	}
+	e.poll()
+
+	if _, _, kind := e.Current(); kind == clipboard.KindText {
+		t.Fatal("换成新内容后应按常规上限判定，不得沿用上一次的放行")
+	}
+	if last, _ := ring.Last(); last.Status != StatusOversize {
+		t.Fatalf("应记录超长事件，实际 %+v", last)
+	}
+}
+
+// 同一段超长内容反复被观测（剪贴板序列号被推高）只记一条事件，不刷屏。
+func TestIdenticalOversizeRecordedOnce(t *testing.T) {
+	long := strings.Repeat("中", 1500)
+	e, clip, ring := newEngine(t, long)
+	e.SetPushLimitFunc(func() int { return 1000 })
+
+	e.Refresh()
+	if last, _ := ring.Last(); last.Status != StatusOversize {
+		t.Fatalf("首次应记录超长事件，实际 %+v", last)
+	}
+	before := len(ring.List())
+
+	for i := 0; i < 3; i++ {
+		if _, err := clip.Write(long, 0); err != nil {
+			t.Fatal(err)
+		}
+		e.poll()
+	}
+	if after := len(ring.List()); after != before {
+		t.Fatalf("内容未变不应重复记事件（新增 %d 条）", after-before)
+	}
+}
+
+// 协议硬上限（64 KiB）连手动推送也突破不了：手机端按这个数拒绝，报"已推送"是假成功。
+func TestForcePushRespectsProtocolMaxBytes(t *testing.T) {
+	huge := strings.Repeat("中", 22000) // 66000 字节 > 64 KiB
+	e, _, ring := newEngine(t, huge)
+	e.SetPushLimitFunc(func() int { return 1000 })
+	e.SetForceLimitFunc(func() int { return 100000 })
+
+	res, err := e.ForcePush()
+	if err != nil {
+		t.Fatalf("强制推送不应返回错误: %v", err)
+	}
+	if res.Status != StatusOversize {
+		t.Fatalf("超过协议上限应记为 oversize，实际 %s", res.Status)
+	}
+	if _, _, kind := e.Current(); kind == clipboard.KindText {
+		t.Fatal("超过协议上限的内容不得进入缓存")
+	}
+	last, _ := ring.Last()
+	if last.Status != StatusOversize || !strings.Contains(last.Note, "协议上限") {
+		t.Fatalf("事件应说明是协议上限，实际 %+v", last)
 	}
 }
 

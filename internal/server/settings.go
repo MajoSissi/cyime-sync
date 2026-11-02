@@ -138,7 +138,7 @@ func (m *Manager) updateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if patch.ForcePushChars != nil {
 			if *patch.ForcePushChars < config.MinPushChars || *patch.ForcePushChars > config.MaxPushChars {
-				return &FieldError{Field: "force_push_chars", Message: fmt.Sprintf("强制推送字符上限需在 %d-%d 之间", config.MinPushChars, config.MaxPushChars)}
+				return &FieldError{Field: "force_push_chars", Message: fmt.Sprintf("手动推送字符上限需在 %d-%d 之间", config.MinPushChars, config.MaxPushChars)}
 			}
 			c.ForcePushChars = *patch.ForcePushChars
 		}

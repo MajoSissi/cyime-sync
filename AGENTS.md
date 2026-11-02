@@ -149,8 +149,11 @@ ETag：对文本内容计算（内容哈希的引号包裹形式，如 `"<sha256
   - 判定来源由 `clipboard.Snapshot.SensitiveOrigin` 区分，判定策略集中在 `syncer.Engine.shouldSkip`，不得在 HTTP 层另写一套。
 - 两个推送上限，都按 Unicode 字符计数（ASCII 与中文都算 1 个字符）：
   - `max_push_chars`（默认 1000，可配 1–100000）：自动推送的上限。超限文本**不进缓存**（GET 返回 204），事件记为 `oversize`。
-  - `force_push_chars`（默认 10000，可配 1–100000）：托盘「推送当前剪贴板」使用的手动上限，忽略常规上限。超限同样不进缓存并记 `oversize`。
+  - `force_push_chars`（默认 10000，可配 1–100000）：托盘「推送」使用的手动上限，忽略常规上限。超限同样不进缓存并记 `oversize`。
   - 手动推送只放宽长度，**不放宽隐私策略**：`shouldSkip` 命中的内容仍然跳过。
+  - 手动推送的放行**绑定内容本身**（`Engine.forceHash`）：成功后同一段内容再被观测到（系统或其它程序把剪贴板原地重设，序列号变、内容不变），或配置变更触发 `Refresh`，都**不得**再按常规上限把它从缓存撤下——否则手机下一次 GET 拿到 204，用户看到的是"强推了却没同步"。剪贴板换成别的内容时放行立即失效；程序重启不保留。
+  - **协议硬上限 64 KiB 不可放宽**：`len(text) > protocol.MaxTextBytes` 时任何路径都记 `oversize` 并说明是协议上限，手动推送也不例外（手机端按同一数值拒绝，报"已推送"是假成功）。
+  - 事件去重：序列号变化但**内容 hash 与判定结论都没变**时不得重复记事件；内容离开过剪贴板（空/非文本/敏感跳过一次）后再出现相同文字，算新的一次推送。
   - v6 迁移只在用户从未改过常规上限（仍是旧默认 5000）时才跟随新默认 1000，自定义值必须保留。
 - 事件流（供设置页实时展示）只保留元数据：时间、方向、来源、字节数、hash 前缀、状态；正文预览恒开但**不落盘**，压成单行、超长时保留头 120 + 尾 40 字符，中间省略。
 - 事件方向文案：`out` → 「推送」，`in` → 「拉取」。
@@ -159,8 +162,8 @@ ETag：对文本内容计算（内容哈希的引号包裹形式，如 `"<sha256
 ## 5. 托盘与进程生命周期
 
 - 单实例：命名互斥量 `Global\CyIMESync.SingleInstance`；第二个实例启动时向已有实例发消息打开设置页后自行退出。
-- 托盘图标：双击 = 打开设置页；右键菜单只含 打开设置、推送当前剪贴板、退出。
-  - 「推送当前剪贴板」调用 `syncer.Engine.ForcePush`，按 `force_push_chars` 判长；同步停用时记一条 `invalid` 事件并放弃。
+- 托盘图标：双击 = 打开设置页；右键菜单只含 设置、推送、退出。
+  - 「推送」调用 `syncer.Engine.ForcePush`，按 `force_push_chars` 判长；同步停用时记一条 `invalid` 事件并放弃。
   - 菜单里**不放**启用/停用同步：同步开关只在设置页顶栏，避免两处状态互相覆盖。
 - 关闭设置页浏览器标签不影响进程；只有"退出"结束进程。不弹关闭确认框。
 - 消息循环必须在主 goroutine 绑定的 OS 线程上跑（`runtime.LockOSThread`），HTTP/同步引擎在其它 goroutine。
@@ -210,7 +213,7 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o build/cyime-sync.exe .
   `go run github.com/akavel/rsrc@latest -ico internal/tray/icon.ico -arch amd64 -o rsrc_windows_amd64.syso`。
   `.syso` 缺失也能构建，但 exe 会退化成默认图标——交付前必须确认 exe 的 `.rsrc` 段非空且与托盘图标同源。
 - 交付前必须实跑：`go vet ./...`、`go test ./...`、`go build` 通过，并实际启动 exe 验证托盘双击打开设置页、扫码配对 → 读写往返、事件流刷新。
-- 推送上限必须双份验证：同一段超过 `max_push_chars` 的文本，常规轮询应记 `oversize`，托盘「推送当前剪贴板」应记 `synced`（`已强制推送`）；再把长度拉到超过 `force_push_chars`，两条路径都应 `oversize`。
+- 推送上限必须双份验证：同一段超过 `max_push_chars` 的文本，常规轮询应记 `oversize`，托盘「推送」应记 `synced`（`已手动推送`）；再把长度拉到超过 `force_push_chars`，两条路径都应 `oversize`。
 - 设置页的数字输入框要实测滚轮：聚焦后滚动不得改变数值（`WheelEvent` 应被 `preventDefault`）。
 - 协议验证用本地回环：起进程后用手工 `curl` 覆盖 200/204/304/400/401/409/413/503 与中文/表情/生僻字/换行文本。
 - 必须额外验证：同一端口 HTTPS 握手成功且证书指纹与二维码内一致；`/api/qr.png` 无令牌 `403`；用二维码里的 `pairing_id`/`secret` 走完 `201` → Bearer 读 `/api/status`、读写 `/api/clipboard`；重复配对 `410`；旧 Basic 请求 `401`。

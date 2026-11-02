@@ -86,9 +86,9 @@ var (
 type Options struct {
 	// Tooltip 托盘悬停提示。
 	Tooltip func() string
-	// OnOpenSettings 双击托盘或点击"打开设置"。
+	// OnOpenSettings 双击托盘或点击菜单「设置」。
 	OnOpenSettings func()
-	// OnForcePush 手动推送当前剪贴板：忽略常规字符上限，改用强制上限。
+	// OnForcePush 手动推送当前剪贴板：忽略常规字符上限，改用手动推送上限。
 	OnForcePush func()
 }
 
@@ -314,8 +314,8 @@ type menuItem struct {
 
 func menuItems() []menuItem {
 	return []menuItem{
-		{cmdOpen, mfString | mfDefault, "打开设置"},
-		{cmdPush, mfString, "推送当前剪贴板"},
+		{cmdOpen, mfString | mfDefault, "设置"},
+		{cmdPush, mfString, "推送"},
 		{0, mfSeparator, ""},
 		{cmdQuit, mfString, "退出"},
 	}

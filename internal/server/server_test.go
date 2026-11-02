@@ -801,3 +801,41 @@ func TestPairingStateHidesSecrets(t *testing.T) {
 		t.Fatalf("应返回剩余时间: %s", body)
 	}
 }
+
+// 手动推送超长内容后，手机 GET 必须真的拿到它——包括之后配置重算一次也不许撤下。
+// 回归背景：序列号被其它程序推高时，旧实现会用常规上限把刚强推的内容清掉，
+// 表现就是"托盘点了推送、事件显示已强制推送，手机却一直不同步"。
+func TestForcePushThenPullServesContent(t *testing.T) {
+	long := strings.Repeat("中", 1500)
+	env := newEnv(t, long) // 构造时已按常规上限判定为超长，缓存为空
+
+	rec := env.do(t, clipboardReq(http.MethodGet, "", env.token))
+	if rec.Code != protocol.StatusNoContent {
+		t.Fatalf("超长内容自动路径应 204，实际 %d", rec.Code)
+	}
+
+	if _, err := env.engine.ForcePush(); err != nil {
+		t.Fatalf("强制推送失败: %v", err)
+	}
+	rec = env.do(t, clipboardReq(http.MethodGet, "", env.token))
+	if rec.Code != protocol.StatusOK {
+		t.Fatalf("强制推送后应能拉到内容，实际 %d", rec.Code)
+	}
+	var profile struct {
+		Text string `json:"text"`
+		Size int    `json:"size"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &profile); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	if profile.Text != long || profile.Size != len(long) {
+		t.Fatalf("返回内容不符: %d 字符 / %d 字节", len([]rune(profile.Text)), profile.Size)
+	}
+
+	// 改上限、页面上开关等都会触发一次重算，不得把刚强推的内容撤下。
+	env.engine.Refresh()
+	rec = env.do(t, clipboardReq(http.MethodGet, "", env.token))
+	if rec.Code != protocol.StatusOK {
+		t.Fatalf("重算不应撤下刚强推的内容，实际 %d", rec.Code)
+	}
+}
