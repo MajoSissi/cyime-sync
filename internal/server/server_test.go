@@ -461,6 +461,32 @@ func TestPairingSessionRotate(t *testing.T) {
 	}
 }
 
+// 设备视图必须带上空闲秒数，设置页据此判断在线/离线。
+func TestPairingViewReportsIdleSeconds(t *testing.T) {
+	env := newEnv(t, "内容")
+
+	rec := env.do(t, env.local(t, http.MethodGet, "/api/pairing"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("读取配对状态应 200，实际 %d", rec.Code)
+	}
+	var view struct {
+		Devices []struct {
+			ID          string `json:"id"`
+			IdleSeconds int    `json:"idle_seconds"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Devices) != 1 {
+		t.Fatalf("newEnv 已配对一台设备，实际 %d 台", len(view.Devices))
+	}
+	// issueToken 走的是真实 Pair，紧接着取状态，空闲时间应当接近 0。
+	if got := view.Devices[0].IdleSeconds; got < 0 || got > 5 {
+		t.Fatalf("刚配对的设备空闲秒数应接近 0，实际 %d", got)
+	}
+}
+
 func TestEventStreamSendsSnapshot(t *testing.T) {
 	env := newEnv(t, "内容")
 	srv := httptest.NewServer(env.mgr.Handler())

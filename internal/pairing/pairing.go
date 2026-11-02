@@ -25,6 +25,9 @@ const (
 	MaxPairBody = 4096
 	// maxFailures 同一窗口内密钥错误次数上限，超过即关闭窗口。
 	maxFailures = 10
+	// OnlineWindow 判定设备"在线"的空闲阈值：手机约每 2 秒轮询一次，
+	// 超过这个时间没有任何请求就当作已离线。前端 `app.js` 里同名常量必须一致。
+	OnlineWindow = 15 * time.Second
 	// tokenBytes 访问令牌随机字节数：base64url 后正好 43 字符（手机端按此校验）。
 	tokenBytes = 32
 )
@@ -88,6 +91,11 @@ type Manager struct {
 	mu     sync.Mutex
 	offer  *offer
 	notify func(event, detail string)
+
+	// seen 记录每台设备最近一次通过令牌认证的时刻，用于设置页显示在线/离线。
+	// 只存内存：进程重启后一律先显示离线，等手机下一次轮询再翻绿。
+	seenMu sync.Mutex
+	seen   map[string]time.Time
 }
 
 // New 加载（或生成）证书并准备配对状态。
@@ -102,6 +110,7 @@ func New(store *config.Store, dir string) (*Manager, error) {
 		fpHex: fingerprint(cert),
 		name:  sanitizeName(hostName(), 64, "CyIME 电脑"),
 		now:   time.Now,
+		seen:  make(map[string]time.Time),
 	}, nil
 }
 
@@ -275,6 +284,8 @@ func (m *Manager) Pair(req PairRequest) (PairResponse, error) {
 		return PairResponse{}, err
 	}
 	resp.DeviceID = cfg.Devices[0].ID
+	// 刚完成配对就当作已活动：手机紧接着就会开始轮询，先点亮在线状态。
+	m.markSeen(resp.DeviceID)
 
 	// 窗口一次性消费：成功配对后必须刷新二维码才能再配一台。
 	m.mu.Lock()
@@ -317,6 +328,7 @@ func (m *Manager) Revoke(id string) (bool, error) {
 	if !found {
 		return false, nil
 	}
+	m.clearSeen(id)
 	m.mu.Lock()
 	notify := m.notify
 	m.mu.Unlock()
@@ -353,10 +365,33 @@ func (m *Manager) Authenticate(token string) (config.PairedDevice, bool) {
 	want := []byte(hashToken(token))
 	for _, d := range m.store.Get().Devices {
 		if subtle.ConstantTimeCompare([]byte(d.TokenHash), want) == 1 {
+			m.markSeen(d.ID)
 			return d, true
 		}
 	}
 	return config.PairedDevice{}, false
+}
+
+// LastSeen 返回设备最近一次活动时间；从未活动过时第二个返回值为 false。
+func (m *Manager) LastSeen(id string) (time.Time, bool) {
+	m.seenMu.Lock()
+	defer m.seenMu.Unlock()
+	t, ok := m.seen[id]
+	return t, ok
+}
+
+// markSeen 记录设备最近活动时间（每个已认证请求都会调用）。
+func (m *Manager) markSeen(id string) {
+	m.seenMu.Lock()
+	m.seen[id] = m.now()
+	m.seenMu.Unlock()
+}
+
+// clearSeen 在设备被撤销时清掉记录，避免内存里留下已删除设备。
+func (m *Manager) clearSeen(id string) {
+	m.seenMu.Lock()
+	delete(m.seen, id)
+	m.seenMu.Unlock()
 }
 
 func newOffer(now time.Time) (*offer, error) {

@@ -16,6 +16,9 @@ type deviceView struct {
 	Name      string    `json:"name"`
 	Note      string    `json:"note"`
 	CreatedAt time.Time `json:"created_at"`
+	// IdleSeconds 是距上次设备请求过去的秒数；-1 表示这次进程启动后还没连过。
+	// 是否算"在线"由设置页按 pairing.OnlineWindow 判断，服务端只给客观数据。
+	IdleSeconds int `json:"idle_seconds"`
 }
 
 // pairingView 是设置页轮询的配对状态。
@@ -37,7 +40,20 @@ func (m *Manager) pairingState() pairingView {
 	v.SecondsLeft = int(left.Round(time.Second).Seconds())
 	v.ServerName = pm.ServerName()
 	for _, d := range pm.Devices() {
-		v.Devices = append(v.Devices, deviceView{ID: d.ID, Name: d.Name, Note: d.Note, CreatedAt: d.CreatedAt})
+		idle := -1
+		if seen, ok := pm.LastSeen(d.ID); ok {
+			idle = int(time.Since(seen).Seconds())
+			if idle < 0 {
+				idle = 0
+			}
+		}
+		v.Devices = append(v.Devices, deviceView{
+			ID:          d.ID,
+			Name:        d.Name,
+			Note:        d.Note,
+			CreatedAt:   d.CreatedAt,
+			IdleSeconds: idle,
+		})
 	}
 	return v
 }

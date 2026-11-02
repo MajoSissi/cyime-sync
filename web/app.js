@@ -9,6 +9,10 @@
   const MAX_EVENTS = 200;
   // 与 /api/pair 的设备上限一致，仅用于列表头部 "n / 8" 提示。
   const MAX_DEVICES = 8;
+  // 与 pairing.OnlineWindow 一致：手机约每 2 秒轮询一次，超过这个秒数没请求就算离线。
+  const ONLINE_WINDOW = 15;
+  // 配对事件之外的低频兜底刷新，用来发现手机重新上线（不算事件轮询）。
+  const PAIRING_POLL_MS = 10000;
   // 成功是默认结果，不再逐条标注「已同步」；只把异常状态显示出来。
   const STATUS_TEXT = {
     duplicate: '重复跳过',
@@ -59,9 +63,12 @@
 
   // 配对窗口 2 分钟：到期前自动换一张，避免用户扫到过期码。
   let pairing = null;
+  let pairingAt = 0; // pairing 的接收时刻，用来推算设备空闲时长
   let qrDeadline = 0;
   let qrNonce = 0;
   let qrBusy = false;
+  // 设备 id → { node, idle, online }：在线状态每秒在本地推进，不重建列表。
+  const deviceStates = new Map();
 
   /* ---------------- 工具 ---------------- */
 
@@ -150,10 +157,10 @@
     qrBusy = true;
     try {
       const path = rotate ? '/api/pairing?rotate=1' : '/api/pairing';
-      pairing = await api(path, { method: 'POST', body: {} });
-      qrDeadline = Date.now() + Math.max(0, pairing.seconds_left || 0) * 1000;
+      const next = await api(path, { method: 'POST', body: {} });
+      qrDeadline = Date.now() + Math.max(0, next.seconds_left || 0) * 1000;
       el.qr.src = qrImageURL();
-      renderPairing();
+      syncPairing(next);
       if (rotate) snack('已生成新的二维码，旧码立即失效');
     } catch {
       el.qrExpiry.textContent = '二维码不可用';
@@ -165,12 +172,64 @@
   function renderPairing() {
     const list = pairing?.devices || [];
     el.devices.replaceChildren();
+    deviceStates.clear();
+    pairingAt = Date.now();
     for (const dev of list) el.devices.appendChild(deviceRow(dev));
     el.devicesCount.textContent = list.length ? `${list.length} / ${MAX_DEVICES}` : '';
     el.devicesWrap.hidden = list.length === 0;
     el.devicesEmpty.hidden = list.length > 0;
     syncDevicesFade();
+    tickDeviceStates();
     tickPairing();
+  }
+
+  // 拿到新的配对状态：设备没增删改名就只换个时间基准，不重建列表，
+  // 免得每 10 秒把正在编辑的备注冲掉、hover 态也跟着闪。
+  function syncPairing(next) {
+    const prev = pairing?.devices || [];
+    const list = next?.devices || [];
+    pairing = next;
+    const same =
+      prev.length === list.length &&
+      prev.every((d, i) => d.id === list[i].id && d.name === list[i].name && d.note === list[i].note);
+    if (!same) {
+      renderPairing();
+      return;
+    }
+    pairingAt = Date.now();
+    for (const dev of list) {
+      const st = deviceStates.get(dev.id);
+      if (st) st.idle = idleOf(dev);
+    }
+    tickDeviceStates();
+    tickPairing();
+  }
+
+  // 服务端只给"距上次设备请求多少秒"，-1 表示这次启动后还没连过。
+  function idleOf(dev) {
+    const v = Number(dev.idle_seconds);
+    return Number.isFinite(v) && v >= 0 ? v : Infinity;
+  }
+
+  // 本地按秒推进空闲时长，越过阈值才改 DOM。
+  function tickDeviceStates() {
+    const drift = (Date.now() - pairingAt) / 1000;
+    for (const st of deviceStates.values()) {
+      const idle = st.idle + drift;
+      const online = idle < ONLINE_WINDOW;
+      if (st.online === online) continue;
+      st.online = online;
+      st.node.dataset.online = String(online);
+      st.node.textContent = online ? '在线' : '离线';
+      st.node.title = online ? '手机正在与电脑同步' : idleTitle(idle);
+    }
+  }
+
+  function idleTitle(idle) {
+    if (!Number.isFinite(idle)) return '接入后还没连过';
+    if (idle < 90) return '最后活动在 1 分钟内';
+    if (idle < 3600) return `最后活动在 ${Math.round(idle / 60)} 分钟前`;
+    return `最后活动在 ${Math.round(idle / 3600)} 小时前`;
   }
 
   // 列表还能往下滚时给底部加渐隐，避免出现半截行被"裁坏"的观感。
@@ -206,7 +265,11 @@
     actions.className = 'device__actions';
     actions.append(noteButton(dev, row), revokeButton(dev));
 
-    row.append(deviceAvatar(), main, actions);
+    const state = document.createElement('span');
+    state.className = 'device__state';
+    deviceStates.set(dev.id, { node: state, idle: idleOf(dev), online: null });
+
+    row.append(deviceAvatar(), main, state, actions);
     return row;
   }
 
@@ -269,10 +332,11 @@
         return;
       }
       try {
-        pairing = await api(`/api/devices?id=${encodeURIComponent(dev.id)}`, {
+        const updated = await api(`/api/devices?id=${encodeURIComponent(dev.id)}`, {
           method: 'PATCH',
           body: { note: next },
         });
+        syncPairing(updated);
         renderPairing();
         snack(next ? `备注已改为「${next}」` : '备注已清空');
       } catch (err) {
@@ -312,8 +376,8 @@
   async function revokeDevice(dev) {
     if (!confirm(`断开「${dev.name}」？该设备需要重新扫码才能同步。`)) return;
     try {
-      pairing = await api(`/api/devices?id=${encodeURIComponent(dev.id)}`, { method: 'DELETE' });
-      renderPairing();
+      const updated = await api(`/api/devices?id=${encodeURIComponent(dev.id)}`, { method: 'DELETE' });
+      syncPairing(updated);
       snack(`已断开 ${dev.name}`);
     } catch (err) {
       snack(err.message || '断开失败', 'error');
@@ -365,44 +429,92 @@
     dir.classList.add(ev.direction === 'in' ? 'dir-in' : 'dir-out');
     if (DIR_TITLE[ev.direction]) dir.title = DIR_TITLE[ev.direction];
 
-    const status = row.querySelector('.event__status');
-    if (ev.status !== 'synced') {
-      status.textContent = STATUS_TEXT[ev.status] || ev.status;
-      status.classList.add(`st-${ev.status}`);
+    // 事件固定两行：第一行只放客观的元信息，第二行放正文或跳过原因。
+    // 有正文时状态进第一行（说明为什么/是否成功）；没有正文时状态就是第二行，
+    // 否则这类事件会矮一行，和别的条目参差不齐。
+    const note = ev.note || (ev.status !== 'synced' ? STATUS_TEXT[ev.status] || ev.status : '');
+    const detail = row.querySelector('.event__detail');
+
+    if (ev.preview) {
+      if (note) {
+        const status = row.querySelector('.event__status');
+        status.textContent = note;
+        status.title = note;
+        if (ev.status === 'synced') {
+          // 手动推送这类成功事件用次级色，不抢正文的注意力。
+          status.dataset.tone = 'muted';
+        } else {
+          status.classList.add(`st-${ev.status}`);
+        }
+      }
+      // 预览先原样放进节点，等插进 DOM 量过宽度再决定要不要截。
+      // 这里拿不到真实行宽（节点还没挂到页面上），先截会把放得下的内容也切掉。
+      detail.textContent = ev.preview;
+      detail.dataset.full = ev.preview;
+      // 预览被截成「头…尾」时，悬停能看完整的一段（服务端已限 160 字符）。
+      detail.title = ev.preview;
+    } else if (note) {
+      const text = document.createElement('span');
+      text.className = 'event__detail-text';
+      text.textContent = note;
+      detail.append(text);
+      detail.title = note;
+      if (ev.status === 'synced') {
+        detail.dataset.tone = 'muted';
+      } else {
+        detail.classList.add(`st-${ev.status}`);
+      }
     }
 
     // 只显示字节数：hash 前缀对用户没有意义，排障看日志文件。
     row.querySelector('.event__meta').textContent = ev.bytes ? formatBytes(ev.bytes) : '';
 
-    if (ev.note) row.querySelector('.event__note').textContent = ev.note;
-    if (ev.preview) renderPreview(row.querySelector('.event__preview'), ev.preview);
-
-    return frag;
+    return row;
   }
 
-  // 单行预览：头部按可用宽度自动省略，尾部固定保留。
-  // 长文本在窄栏里也能同时看到"开头是什么"和"结尾是什么"。
-  function renderPreview(node, text) {
-    const chars = Array.from(text);
-    if (chars.length <= PREVIEW_TAIL * 2) {
-      node.textContent = text;
-      return;
+  // 单行预览：放得下就整段照抄；放不下才切成「头 + … + 尾」，
+  // 让长文本在窄栏里也能同时看到开头和结尾。
+  function fitPreviews(rows) {
+    const clipped = [];
+    for (const row of rows) {
+      const node = row.querySelector('.event__detail[data-full]');
+      if (!node) continue;
+      if (node.scrollWidth > node.clientWidth) clipped.push(node);
     }
+    // 先量完再改，避免每行都触发一次重排。
+    const parts = clipped.map((node) => splitPreview(node, node.dataset.full)).filter(Boolean);
+    // 头部自己被裁掉时会补一个省略号，此时中间的「…」要去掉，否则连成「……」。
+    for (const { head, gap } of parts) {
+      if (head.scrollWidth > head.clientWidth) gap.textContent = '';
+    }
+  }
+
+  function splitPreview(node, text) {
+    const chars = Array.from(text);
+    if (chars.length <= PREVIEW_TAIL * 2 + 1) return null;
+
     const head = document.createElement('span');
-    head.className = 'event__preview-head';
+    head.className = 'event__detail-head';
     head.textContent = chars.slice(0, chars.length - PREVIEW_TAIL).join('');
 
+    // 省略号独立成元素：头部没被裁时由它标出中间缺了一段。
+    const gap = document.createElement('span');
+    gap.className = 'event__detail-gap';
+    gap.textContent = '…';
+
     const tail = document.createElement('span');
-    tail.className = 'event__preview-tail';
+    tail.className = 'event__detail-tail';
     tail.textContent = chars.slice(-PREVIEW_TAIL).join('');
 
-    node.replaceChildren(head, tail);
+    node.replaceChildren(head, gap, tail);
+    return { head, gap };
   }
 
   function renderEvents() {
     for (const row of el.events.querySelectorAll('.event')) row.remove();
     el.empty.hidden = events.length > 0;
-    for (const ev of events) el.events.appendChild(eventNode(ev));
+    const rows = events.map((ev) => el.events.appendChild(eventNode(ev)));
+    fitPreviews(rows);
   }
 
   function prependEvent(ev) {
@@ -410,7 +522,9 @@
     events.unshift(ev);
     if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
     el.empty.hidden = true;
-    el.events.prepend(eventNode(ev));
+    const row = eventNode(ev);
+    el.events.prepend(row);
+    fitPreviews([row]);
     while (el.events.querySelectorAll('.event').length > MAX_EVENTS) {
       el.events.querySelector('.event:last-of-type')?.remove();
     }
@@ -429,9 +543,8 @@
         events = (payload.events || []).slice(0, MAX_EVENTS);
         renderEvents();
         if (payload.pairing) {
-          pairing = payload.pairing;
           qrDeadline = Date.now() + Math.max(0, payload.pairing.seconds_left || 0) * 1000;
-          renderPairing();
+          syncPairing(payload.pairing);
         }
       } catch {
         /* 单帧解析失败忽略 */
@@ -448,8 +561,7 @@
       try {
         const payload = JSON.parse(e.data);
         if (payload.state) {
-          pairing = payload.state;
-          renderPairing();
+          syncPairing(payload.state);
         }
         if (payload.event === 'paired') {
           snack(`${payload.detail || '设备'} 已连接`);
@@ -465,6 +577,18 @@
   }
 
   /* ---------------- 交互 ---------------- */
+
+  // 只读配对状态（不新开窗口，窗口由 POST 负责）。正在改备注时跳过，
+  // 否则列表重建会把输入框冲掉。
+  async function refreshPairingState() {
+    if (!IS_LOCAL || portChanged) return;
+    if (document.querySelector('.device__input')) return;
+    try {
+      syncPairing(await api('/api/pairing'));
+    } catch {
+      /* 单次失败忽略，下一周期再试 */
+    }
+  }
 
   async function loadAll() {
     if (!IS_LOCAL) {
@@ -549,8 +673,8 @@
     el.devices.addEventListener('scroll', syncDevicesFade, { passive: true });
     window.addEventListener('resize', syncDevicesFade);
 
-    bindCharLimit(el.maxChars, 'max_push_chars', '推送字符上限');
-    bindCharLimit(el.forceChars, 'force_push_chars', '强制推送字符上限');
+    bindCharLimit(el.maxChars, 'max_push_chars', '自动推送字符上限');
+    bindCharLimit(el.forceChars, 'force_push_chars', '手动推送字符上限');
 
     el.port.addEventListener('change', async () => {
       const value = Number(el.port.value);
@@ -589,8 +713,20 @@
   if (!IS_LOCAL) setReadOnly();
   loadAll();
 
-  // 二维码倒计时在本地推进，不发起网络请求。
+  // 二维码倒计时与设备在线状态都在本地推进，不发起网络请求。
   setInterval(() => {
-    if (IS_LOCAL && !portChanged) tickPairing();
+    if (!IS_LOCAL || portChanged) return;
+    tickPairing();
+    tickDeviceStates();
   }, 1000);
+
+  // 手机重新上线不会产生配对事件，只能靠低频兜底刷新发现；切回页面时立刻刷新一次。
+  setInterval(() => {
+    if (!IS_LOCAL || portChanged || document.visibilityState !== 'visible') return;
+    refreshPairingState();
+  }, PAIRING_POLL_MS);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshPairingState();
+  });
 })();

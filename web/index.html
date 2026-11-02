@@ -62,11 +62,11 @@
       <section class="card" aria-labelledby="syncTitle">
         <h2 id="syncTitle">同步</h2>
         <div class="row">
-          <label class="row__label" for="maxCharsInput" title="中文、英文都按 1 个字符计；超过上限的内容不会自动推到手机">推送字符上限</label>
+          <label class="row__label" for="maxCharsInput" title="自动推送（后台监听剪贴板）时使用；中文、英文都按 1 个字符计，超过上限的内容不推送到手机">自动推送字符上限</label>
           <input class="input" id="maxCharsInput" type="number" min="1" max="100000" step="100" inputmode="numeric" spellcheck="false">
         </div>
         <div class="row">
-          <label class="row__label" for="forceCharsInput" title="托盘菜单「推送当前剪贴板」时使用，比常规上限宽松；中英文都按 1 个字符计">强制推送上限</label>
+          <label class="row__label" for="forceCharsInput" title="托盘菜单「推送当前剪贴板」时使用，比自动推送宽松；中英文都按 1 个字符计">手动推送字符上限</label>
           <input class="input" id="forceCharsInput" type="number" min="1" max="100000" step="500" inputmode="numeric" spellcheck="false">
         </div>
         <div class="row">
@@ -120,14 +120,11 @@
 
 <template id="eventRow">
   <div class="event">
-    <div class="event__line">
-      <span class="event__time"></span>
-      <span class="event__dir"></span>
-      <span class="event__status"></span>
-      <span class="event__meta"></span>
-    </div>
-    <p class="event__note"></p>
-    <p class="event__preview"></p>
+    <span class="event__dir"></span>
+    <span class="event__time"></span>
+    <span class="event__status"></span>
+    <span class="event__meta"></span>
+    <div class="event__detail"></div>
   </div>
 </template>
 

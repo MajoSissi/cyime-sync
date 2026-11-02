@@ -170,6 +170,42 @@ func TestRotateReplacesWindow(t *testing.T) {
 	}
 }
 
+// 在线状态依赖"最近一次认证时间"：配对成功即点亮，认证会刷新，撤销后清掉。
+func TestLastSeenFollowsAuthentication(t *testing.T) {
+	m, _ := newManager(t)
+	if _, _, err := m.QR([]Endpoint{{Host: "192.168.1.8", Port: 18740}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := m.Pair(PairRequest{
+		V: 2, PairingID: m.offer.id, Secret: m.offer.secretB64,
+		ClientID: "6f1f3f9e-5f0b-4a1e-9c7d-0b8f2f4d3a11", ClientName: "Pixel 8",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.LastSeen(resp.DeviceID); !ok {
+		t.Fatal("配对成功后应立即算作活动过")
+	}
+
+	m.clearSeen(resp.DeviceID)
+	if _, ok := m.LastSeen(resp.DeviceID); ok {
+		t.Fatal("清空后不应还有记录")
+	}
+	if _, ok := m.Authenticate(resp.AccessToken); !ok {
+		t.Fatal("配对返回的令牌应当有效")
+	}
+	if _, ok := m.LastSeen(resp.DeviceID); !ok {
+		t.Fatal("认证通过后应刷新活动时间")
+	}
+
+	if _, err := m.Revoke(resp.DeviceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.LastSeen(resp.DeviceID); ok {
+		t.Fatal("撤销后应清掉活动记录")
+	}
+}
+
 func TestPairIssuesTokenAndRotatesOnRepair(t *testing.T) {
 	m, store := newManager(t)
 	if _, _, err := m.QR([]Endpoint{{Host: "192.168.1.8", Port: 18740}}); err != nil {

@@ -34,6 +34,11 @@
   --md-success: #1f6f4a;
   --md-warning: #7a5900;
 
+  /* 事件条目：浅色下用最亮的白从卡片底（container-low）浮起来，
+     不用描边也不用分割线，靠块面本身分层。 */
+  --event-surface: var(--md-surface-container-lowest);
+  --event-surface-hover: var(--md-surface-container);
+
   --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
     "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
   --font-display: "Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI",
@@ -78,6 +83,10 @@
     --md-on-error-container: #f9dedc;
     --md-success: #7fd1a8;
     --md-warning: #f2c94c;
+
+    /* 深色反过来：用高一级容器色表示抬起。 */
+    --event-surface: var(--md-surface-container-high);
+    --event-surface-hover: var(--md-surface-container-highest);
   }
 }
 
@@ -469,6 +478,35 @@ button {
   white-space: nowrap;
 }
 
+/* 在线状态：绿点表示手机正在轮询本机，灰点表示这台设备当前没连上。 */
+.device__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--md-on-surface-variant);
+  white-space: nowrap;
+}
+
+.device__state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--md-outline);
+}
+
+.device__state[data-online="true"] {
+  color: var(--md-success);
+}
+
+.device__state[data-online="true"]::before {
+  background: var(--md-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--md-success) 16%, transparent);
+}
+
 .device__actions {
   display: flex;
   flex: none;
@@ -723,11 +761,18 @@ button {
 .events {
   flex: 1;
   min-height: 0;
-  padding-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 2px 12px;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
   scrollbar-color: var(--md-outline-variant) transparent;
+  /* 列表被卡片高度截断时，最下面那块会恰好被切一半。底部 20px 渐隐把它淡出，
+     顺带提示「还有更多」。内容不够长时这段是空白，不影响观感。 */
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent);
 }
 
 .events::-webkit-scrollbar {
@@ -739,14 +784,24 @@ button {
   border-radius: 999px;
 }
 
+/* 事件固定两行，整条就是一个圆角块：第一行 方向胶囊 / 时间 / 说明 / 字节数，
+   第二行从最左开始跨满整块。条目之间靠留白与块面底色分隔，
+   不用分割线——线在深色主题下太抢眼，块面则能安静地托住内容。 */
 .event {
-  padding: 11px 2px 9px;
-  border-bottom: 1px dashed color-mix(in srgb, var(--md-outline-variant) 85%, transparent);
+  display: grid;
+  grid-template-columns: auto 58px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 3px;
+  padding: 8px 11px;
+  border-radius: var(--shape-md);
+  background: var(--event-surface);
+  transition: background 0.16s var(--ease);
   animation: slide 0.26s var(--ease) both;
 }
 
-.event:last-child {
-  border-bottom: none;
+.event:hover {
+  background: var(--event-surface-hover);
 }
 
 @keyframes slide {
@@ -756,28 +811,22 @@ button {
   }
 }
 
-.event__line {
-  display: grid;
-  grid-template-columns: 62px auto 1fr auto;
-  align-items: center;
-  gap: 10px;
-}
-
 .event__time {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   color: var(--md-on-surface-variant);
+  white-space: nowrap;
 }
 
 .event__dir {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 21px;
-  padding: 0 8px;
+  height: 18px;
+  padding: 0 7px;
   border-radius: 999px;
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
   white-space: nowrap;
 }
@@ -792,15 +841,83 @@ button {
   color: var(--md-on-secondary-container);
 }
 
+/* 状态列只放一段文字（说明优先、分类兜底），压在时间与字节数之间；
+   放不下时行尾省略，悬停看全文。 */
 .event__status {
+  display: block;
+  min-width: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
+  line-height: 18px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* 成功不标注，只有例外状态才上色（颜色规则见下方 .event__detail 之后）。 */
+
+.event__meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--md-on-surface-variant);
+  white-space: nowrap;
+  text-align: right;
+}
+
+/* 成功事件里带说明的（手动推送）用次级色，例外状态沿用状态色。 */
+.event__status[data-tone='muted'],
+.event__detail[data-tone='muted'] {
+  color: var(--md-on-surface-variant);
+  font-weight: 400;
+}
+
+/* 事件固定两行：第二行永远占位（min-height），有正文放正文，
+   没有正文就放跳过原因。这样每条都是两行高，列表不会一段高一段矮。
+   第二行横跨整块（从最左边缘起），正文与方向胶囊左对齐，
+   读起来是「[推送] 时间」加下方整段内容，而不是被时间列推着往右缩。 */
+.event__detail {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  min-height: 16px;
+  color: var(--md-on-surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* 原因行没有正文可截，整段单行省略，悬停看全文。 */
+.event__detail-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 头部让位给尾部：被裁时自己补省略号；没被裁就靠中间的「…」标出缺了一段。 */
+.event__detail-head {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event__detail-gap {
+  flex: none;
+  color: var(--md-on-surface-variant);
+}
+
+.event__detail-tail {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 状态色放在最后：与上面 `.event__detail` 的基础色同为单类选择器，
+   靠顺序覆盖，否则原因行会被正文颜色吃掉。 */
 /* 成功不标注，只有例外状态才上色。 */
 .st-duplicate {
   color: var(--md-primary);
@@ -819,54 +936,6 @@ button {
 
 .st-empty {
   color: var(--md-on-surface-variant);
-}
-
-.event__meta {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--md-on-surface-variant);
-  white-space: nowrap;
-  text-align: right;
-}
-
-.event__note {
-  margin-top: 4px;
-  font-size: 11.5px;
-  color: var(--md-on-surface-variant);
-  overflow-wrap: anywhere;
-}
-
-.event__preview {
-  display: flex;
-  align-items: baseline;
-  margin-top: 6px;
-  padding: 7px 9px;
-  border-radius: var(--shape-sm);
-  background: var(--md-surface-container-high);
-  color: var(--md-on-surface);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.45;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-/* 头部让位给尾部：宽度不够时由浏览器在头部末尾补省略号。 */
-.event__preview-head {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.event__preview-tail {
-  flex: none;
-  white-space: nowrap;
-}
-
-.event__note:empty,
-.event__preview:empty {
-  display: none;
 }
 
 .empty {
@@ -953,8 +1022,8 @@ button {
     max-height: none;
   }
 
-  .event__line {
-    grid-template-columns: 58px auto 1fr;
+  .event {
+    grid-template-columns: auto 54px minmax(0, 1fr);
   }
 
   .event__meta {
