@@ -487,8 +487,12 @@ func TestPairingViewReportsIdleSeconds(t *testing.T) {
 	}
 }
 
-func TestEventStreamSendsSnapshot(t *testing.T) {
+// 设置页只展示「打开之后」的同步流水：首帧快照不得携带历史事件，
+// 否则长会话会一次性把几百条记录画进 DOM（页面卡顿的根因），刷新也清不掉。
+func TestEventStreamSnapshotSkipsHistory(t *testing.T) {
 	env := newEnv(t, "内容")
+	// 先制造一条历史事件，确认它不会被塞进快照。
+	env.mgr.opts.Engine.Ring().Add(syncer.Event{Direction: syncer.DirOut, Status: syncer.StatusSynced})
 	srv := httptest.NewServer(env.mgr.Handler())
 	defer srv.Close()
 
@@ -521,8 +525,12 @@ func TestEventStreamSendsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(data, `"events"`) {
-		t.Fatalf("snapshot 应包含事件列表，实际 %q", data)
+	// status 里也有个 events 计数（数字），这里只拦事件数组。
+	if strings.Contains(data, `"events":[`) {
+		t.Fatalf("snapshot 不应再下发历史事件，实际 %q", data)
+	}
+	if !strings.Contains(data, `"pairing"`) {
+		t.Fatalf("snapshot 应包含配对状态，实际 %q", data)
 	}
 	_, _ = io.Copy(io.Discard, reader)
 }

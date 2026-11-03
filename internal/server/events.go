@@ -50,19 +50,20 @@ func (m *Manager) streamEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	// 首帧快照：事件列表 + 状态 + 配对状态，页面据此完成首屏渲染。
-	writeSSE(w, "snapshot", map[string]any{
-		"events":  m.opts.Engine.Ring().List(),
-		"status":  m.statusView(),
-		"pairing": m.pairingState(),
-	})
-	flusher.Flush()
-
+	// 先订阅再发首帧，避免这两步之间产生的事件被漏掉。
 	ch, cancel := m.opts.Engine.Ring().Subscribe()
 	defer cancel()
 
 	pairCh, unsubscribe := m.subscribePairing()
 	defer unsubscribe()
+
+	// 首帧只给状态与配对状态，不再下发历史事件：设置页只展示「本次打开之后」的同步行为，
+	// 刷新即清空。历史仍在服务端环里（供日志/排障），但页面既不需要也不该一次画几百条。
+	writeSSE(w, "snapshot", map[string]any{
+		"status":  m.statusView(),
+		"pairing": m.pairingState(),
+	})
+	flusher.Flush()
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()

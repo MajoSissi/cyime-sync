@@ -6,7 +6,9 @@
   const TOKEN = (document.querySelector('meta[name="cyime-token"]')?.content || '').trim();
   const IS_LOCAL = (document.querySelector('meta[name="cyime-local"]')?.content || '0').trim() === '1';
 
-  const MAX_EVENTS = 200;
+  // 页面内只保留最近 50 条：事件区是「本次打开之后的同步流水」，不加载历史，
+  // 条目也没必要堆到几百条——长列表在低配机器上量宽度、重排都会拖慢滚动。
+  const MAX_EVENTS = 50;
   // 与 /api/pair 的设备上限一致，仅用于列表头部 "n / 8" 提示。
   const MAX_DEVICES = 8;
   // 与 pairing.OnlineWindow 一致：手机约每 2 秒轮询一次，超过这个秒数没请求就算离线。
@@ -520,13 +522,14 @@
   function prependEvent(ev) {
     if (events.some((e) => e.id === ev.id)) return;
     events.unshift(ev);
-    if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
     el.empty.hidden = true;
     const row = eventNode(ev);
     el.events.prepend(row);
     fitPreviews([row]);
-    while (el.events.querySelectorAll('.event').length > MAX_EVENTS) {
-      el.events.querySelector('.event:last-of-type')?.remove();
+    // 超出上限时连 DOM 一起丢掉最旧的一条，长会话也不会越滚越卡。
+    while (events.length > MAX_EVENTS) {
+      events.pop();
+      el.events.lastElementChild?.remove();
     }
   }
 
@@ -540,8 +543,8 @@
     stream.addEventListener('snapshot', (e) => {
       try {
         const payload = JSON.parse(e.data);
-        events = (payload.events || []).slice(0, MAX_EVENTS);
-        renderEvents();
+        // 快照里没有 events：设置页只累积「打开之后」产生的事件，刷新即清空。
+        // 重连时同样不动已有列表，避免把页面里已经看到的事件冲掉。
         if (payload.pairing) {
           qrDeadline = Date.now() + Math.max(0, payload.pairing.seconds_left || 0) * 1000;
           syncPairing(payload.pairing);
