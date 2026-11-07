@@ -21,8 +21,11 @@ import (
 )
 
 const (
-	// PollInterval 序列号轮询间隔。安卓端约 2 秒 GET 一次，350ms 足够新鲜。
-	PollInterval = 350 * time.Millisecond
+	// PollInterval 序列号轮询间隔。安卓端约 2 秒 GET 一次，150ms 足够新鲜；
+	// 一次轮询只是读 GetClipboardSequenceNumber（一个计数器），成本可忽略。
+	PollInterval = 150 * time.Millisecond
+	// busyNoteInterval 同一段剪贴板读取失败的最短记事件间隔，避免被长期占用时刷屏。
+	busyNoteInterval = 5 * time.Second
 	// PreviewLimit 正文预览最大字符数（只在内存里，不落盘）。
 	PreviewLimit = 160
 	// previewHead / previewTail 超长预览保留的头尾长度，中间用省略号。
@@ -55,6 +58,10 @@ type Engine struct {
 	// 序列号变化但内容和结论都没变时，不重复记事件。
 	seenHash   string
 	seenStatus string
+	// busySeq / busyAt 记录最近一次「剪贴板读不出来」的序列号与时间。
+	// 读取失败默认是静默重试，用户只会看到「复制了却没反应」；这里把它变成一条节流事件。
+	busySeq uint32
+	busyAt  time.Time
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -359,7 +366,9 @@ func (e *Engine) poll() {
 
 	snap, err := e.clip.Read()
 	if err != nil {
-		// 读取失败通常是被占用：序列号未推进，下一轮自然重试。
+		// 读取失败通常是被占用：序列号未推进，下一轮自动重试。
+		// 但完全静默会让用户以为「复制了不同步」，所以记一条节流事件说明在重试。
+		e.noteReadFailure(seq)
 		return
 	}
 	if snap.Seq == 0 {
@@ -452,6 +461,22 @@ func (e *Engine) poll() {
 		e.seenHash, e.seenStatus = "", ""
 		e.mu.Unlock()
 	}
+}
+
+// noteReadFailure 记录一次「剪贴板读不出来」。
+//
+// 同一序列号 5 秒内只记一条：失败会被每 150ms 重试一次，不节流会把事件区刷满。
+// 不推进 lastSeq，下一轮仍会重试这一段内容。
+func (e *Engine) noteReadFailure(seq uint32) {
+	e.mu.Lock()
+	quiet := e.busySeq == seq && time.Since(e.busyAt) < busyNoteInterval
+	e.busySeq, e.busyAt = seq, time.Now()
+	e.mu.Unlock()
+	if quiet {
+		return
+	}
+	e.record(Event{Direction: DirOut, Source: protocol.SourceDesktop}, StatusBusy,
+		"剪贴板被其它程序占用，这次变化没读到，正在自动重试")
 }
 
 // refresh 主动读取一次剪贴板（启动预热、修改上限后立即重算）。

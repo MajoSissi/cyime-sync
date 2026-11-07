@@ -138,7 +138,9 @@ ETag：对文本内容计算（内容哈希的引号包裹形式，如 `"<sha256
 
 ## 4. 同步引擎行为约束
 
-- 变化检测用 `GetClipboardSequenceNumber`，不做轮询读全文；序列号变化才 `OpenClipboard` 读内容。
+- 变化检测用 `GetClipboardSequenceNumber`，不做轮询读全文；序列号变化才 `OpenClipboard` 读内容。轮询间隔 `syncer.PollInterval` = **150ms**（一次轮询只是读一个计数器，成本可忽略）。安卓端约 2 秒 GET 一次，所以端到端最坏约 2.2 秒，典型 1–2 秒。
+- 文本兼容 `CF_UNICODETEXT` 与 `CF_TEXT`：少数老程序/终端只写 ANSI，必须按系统代码页（`CP_ACP`）回转；否则现象是「复制了却不同步」且没有任何事件可查。两者都没有才算 `KindNonText`。
+- 读取失败不得静默：记一条 `busy` 事件（同一序列号 5 秒内最多一条），**保持上一份缓存**（不能返回 204 把手机 ETag 清掉），下一轮自动重试。
 - 读写剪贴板必须带重试（`OpenClipboard` 失败按 ~10–30ms 间隔重试，总预算 ≤ 500ms），重试耗尽返回 `503`。
 - 写入用 `GlobalAlloc(GMOVEABLE)` + `CF_UNICODETEXT`；写入前再次校验序列号（CAS 语义），不符返回 `409`。
 - 自写抑制：本进程写入产生的序列号变化不得回送成"电脑新内容"事件，也不得被当成新条目再次推送。

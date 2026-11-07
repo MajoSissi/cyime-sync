@@ -12,7 +12,11 @@ import (
 )
 
 const (
+	cfText        = 1
 	cfUnicodeText = 13
+
+	// cpACP 是系统 ANSI 代码页；CF_TEXT 数据按它解释。
+	cpACP = 0
 
 	gmemMoveable = 0x0002
 
@@ -39,6 +43,7 @@ var (
 	procGlobalUnlock               = kernel32.NewProc("GlobalUnlock")
 	procGlobalFree                 = kernel32.NewProc("GlobalFree")
 	procGlobalSize                 = kernel32.NewProc("GlobalSize")
+	procMultiByteToWideChar        = kernel32.NewProc("MultiByteToWideChar")
 )
 
 // 敏感内容标记格式，懒注册后缓存。
@@ -79,23 +84,8 @@ func (c *winClipboard) Read() (Snapshot, error) {
 			snap.SensitiveOrigin = SensitiveDeclared
 		}
 
-		r, _, _ := procIsClipboardFormatAvailable.Call(cfUnicodeText)
-		if r == 0 {
-			snap.Kind = KindNonText
-			return nil
-		}
-		h, _, _ := procGetClipboardData.Call(cfUnicodeText)
-		if h == 0 {
-			snap.Kind = KindEmpty
-			return nil
-		}
-		snap.Text = readGlobalText(h)
-		if snap.Text == "" {
-			snap.Kind = KindEmpty
-			return nil
-		}
-		snap.Kind = KindText
-		if !snap.Sensitive && isLikelyOTP(snap.Text) {
+		snap.Text, snap.Kind = readClipboardText()
+		if snap.Kind == KindText && !snap.Sensitive && isLikelyOTP(snap.Text) {
 			snap.Sensitive = true
 			snap.SensitiveReason = "疑似短信验证码（纯数字短文本）"
 			snap.SensitiveOrigin = SensitiveGuess
@@ -197,6 +187,35 @@ func uintptrToPtr(v uintptr) unsafe.Pointer {
 	return *(*unsafe.Pointer)(unsafe.Pointer(&v))
 }
 
+// readClipboardText 读取剪贴板里的纯文本（调用前必须已打开剪贴板）。
+//
+// 优先 CF_UNICODETEXT；少数老程序、终端或工具只写 CF_TEXT（ANSI）。不兼容这类来源时，
+// 用户看到的现象就是「复制了却不同步」，而且没有任何事件可查——所以这里按系统 ANSI
+// 代码页再回转一次，把"能读到的都读出来"。
+func readClipboardText() (string, Kind) {
+	if formatAvailable(cfUnicodeText) {
+		h, _, _ := procGetClipboardData.Call(cfUnicodeText)
+		if h == 0 {
+			return "", KindEmpty
+		}
+		if s := readGlobalText(h); s != "" {
+			return s, KindText
+		}
+		return "", KindEmpty
+	}
+	if formatAvailable(cfText) {
+		h, _, _ := procGetClipboardData.Call(cfText)
+		if h == 0 {
+			return "", KindEmpty
+		}
+		if s := readGlobalANSI(h); s != "" {
+			return s, KindText
+		}
+		return "", KindEmpty
+	}
+	return "", KindNonText
+}
+
 // readGlobalText 把 CF_UNICODETEXT 句柄读成 Go 字符串。
 func readGlobalText(h uintptr) string {
 	ptr, _, _ := procGlobalLock.Call(h)
@@ -211,6 +230,43 @@ func readGlobalText(h uintptr) string {
 	}
 	n := int(size / 2)
 	buf := unsafe.Slice((*uint16)(uintptrToPtr(ptr)), n)
+	return windows.UTF16ToString(buf)
+}
+
+// readGlobalANSI 把 CF_TEXT 句柄按系统 ANSI 代码页读成 Go 字符串。
+//
+// 数据按规范以 NUL 结尾，但长度仍以 GlobalSize 为准：不依赖结尾符也能读全。
+func readGlobalANSI(h uintptr) string {
+	ptr, _, _ := procGlobalLock.Call(h)
+	if ptr == 0 {
+		return ""
+	}
+	defer procGlobalUnlock.Call(h)
+
+	size, _, _ := procGlobalSize.Call(h)
+	if size < 1 {
+		return ""
+	}
+	raw := unsafe.Slice((*byte)(uintptrToPtr(ptr)), int(size))
+	for len(raw) > 0 && raw[len(raw)-1] == 0 {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) == 0 {
+		return ""
+	}
+
+	// 第一次调用只问所需 UTF-16 长度，第二次真正转换。
+	n, _, _ := procMultiByteToWideChar.Call(cpACP, 0,
+		uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)), 0, 0)
+	if n == 0 {
+		return ""
+	}
+	buf := make([]uint16, int(n))
+	if r, _, _ := procMultiByteToWideChar.Call(cpACP, 0,
+		uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)),
+		uintptr(unsafe.Pointer(&buf[0])), n); r == 0 {
+		return ""
+	}
 	return windows.UTF16ToString(buf)
 }
 

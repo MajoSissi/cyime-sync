@@ -472,3 +472,40 @@ func TestForcePushOnNonText(t *testing.T) {
 		t.Fatalf("事件不符: %+v", last)
 	}
 }
+
+// 读剪贴板失败不能静默：用户会觉得"复制了不同步"。要留一条 busy 事件说明在重试，
+// 但同一段内容 5 秒内只记一条，避免每 150ms 重试一次把事件区刷满。
+func TestReadFailureIsReportedOnceThenRecovers(t *testing.T) {
+	e, clip, ring := newEngine(t, "原始")
+	// 制造一次变化，poll 才会走到读取分支。
+	if _, err := clip.Write("新的", clip.Sequence()); err != nil {
+		t.Fatalf("准备内容失败: %v", err)
+	}
+	clip.Busy.Store(true)
+
+	e.poll()
+	e.poll()
+
+	busy := 0
+	for _, ev := range ring.List() {
+		if ev.Status == StatusBusy {
+			busy++
+		}
+	}
+	if busy != 1 {
+		t.Fatalf("连续读取失败应只记一条 busy 事件，实际 %d 条", busy)
+	}
+	// 读不到新内容时保留上一次的缓存：手机至少还能拿到旧内容，
+	// 不能因为一次占用失败就返回 204 把手机端 ETag 清掉。
+	if text, _, kind := e.Current(); kind != clipboard.KindText || text != "原始" {
+		t.Fatalf("读取失败时缓存应保持上一次内容，实际 kind=%v text=%q", kind, text)
+	}
+
+	// 占用解除后下一轮应自动补上，不需要用户再复制一次。
+	clip.Busy.Store(false)
+	e.poll()
+	text, _, kind := e.Current()
+	if kind != clipboard.KindText || text != "新的" {
+		t.Fatalf("恢复后应补上内容，实际 kind=%v text=%q", kind, text)
+	}
+}
