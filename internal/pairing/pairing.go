@@ -96,6 +96,11 @@ type Manager struct {
 	// 只存内存：进程重启后一律先显示离线，等手机下一次轮询再翻绿。
 	seenMu sync.Mutex
 	seen   map[string]time.Time
+
+	// pushFail 记录「主动推送到这台设备」是否连续失败。手机端据此决定是否退回轮询，
+	// 所以只存内存：进程重启后先当作正常，真失败会立刻重新标上。
+	pushMu   sync.Mutex
+	pushFail map[string]bool
 }
 
 // New 加载（或生成）证书并准备配对状态。
@@ -105,12 +110,13 @@ func New(store *config.Store, dir string) (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		store: store,
-		cert:  cert,
-		fpHex: fingerprint(cert),
-		name:  sanitizeName(hostName(), 64, "CyIME 电脑"),
-		now:   time.Now,
-		seen:  make(map[string]time.Time),
+		store:    store,
+		cert:     cert,
+		fpHex:    fingerprint(cert),
+		name:     sanitizeName(hostName(), 64, "CyIME 电脑"),
+		now:      time.Now,
+		seen:     make(map[string]time.Time),
+		pushFail: make(map[string]bool),
 	}, nil
 }
 
@@ -329,6 +335,7 @@ func (m *Manager) Revoke(id string) (bool, error) {
 		return false, nil
 	}
 	m.clearSeen(id)
+	m.SetPushFailed(id, false)
 	m.mu.Lock()
 	notify := m.notify
 	m.mu.Unlock()
@@ -355,6 +362,64 @@ func (m *Manager) SetNote(id, note string) (bool, error) {
 		return false, err
 	}
 	return found, nil
+}
+
+// SetPushTarget 记录设备反向注册的推送地址（手机端 POST /api/peer 时写入）。
+//
+// 这是「电脑主动推给手机」的唯一凭据来源：地址、证书指纹、令牌全部由手机给出，
+// 电脑只负责保存。重新登记会清掉上一次的失败标记，避免手机因旧故障一直退回轮询。
+func (m *Manager) SetPushTarget(id string, t config.PushTarget) (bool, error) {
+	found := false
+	if _, err := m.store.Update(func(c *config.Config) error {
+		for i := range c.Devices {
+			if c.Devices[i].ID != id {
+				continue
+			}
+			target := t
+			c.Devices[i].Push = &target
+			found = true
+			return nil
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if found {
+		m.SetPushFailed(id, false)
+	}
+	return found, nil
+}
+
+// PushTarget 返回设备已登记的推送地址。
+func (m *Manager) PushTarget(id string) (config.PushTarget, bool) {
+	for _, d := range m.store.Get().Devices {
+		if d.ID == id && d.Push != nil {
+			return *d.Push, true
+		}
+	}
+	return config.PushTarget{}, false
+}
+
+// Touch 把设备标记为刚刚可达。推送成功同样证明它在网，不能让设置页显示成离线。
+func (m *Manager) Touch(id string) { m.markSeen(id) }
+
+// SetPushFailed 记录主动推送是否连续失败。手机端看到失败标记会退回旧版轮询，
+// 因此宁可多标一次，也不能让推送静默失败、两边都不动。
+func (m *Manager) SetPushFailed(id string, failed bool) {
+	m.pushMu.Lock()
+	defer m.pushMu.Unlock()
+	if failed {
+		m.pushFail[id] = true
+		return
+	}
+	delete(m.pushFail, id)
+}
+
+// PushFailed 返回该设备的推送是否处于失败状态。
+func (m *Manager) PushFailed(id string) bool {
+	m.pushMu.Lock()
+	defer m.pushMu.Unlock()
+	return m.pushFail[id]
 }
 
 // Authenticate 校验访问令牌，返回对应的设备。

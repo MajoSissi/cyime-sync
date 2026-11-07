@@ -15,6 +15,7 @@ import (
 	"cyime-sync/internal/config"
 	"cyime-sync/internal/logging"
 	"cyime-sync/internal/pairing"
+	"cyime-sync/internal/relay"
 	"cyime-sync/internal/server"
 	"cyime-sync/internal/syncer"
 	"cyime-sync/internal/tray"
@@ -22,7 +23,9 @@ import (
 )
 
 // version 用于日志与排障时对照。
-const version = "1.5.0"
+// 1.6.0：新增反向推送（POST /api/peer + /api/status 的 push 字段），配合新版手机端的
+// 设备互推；旧版手机仍走轮询。
+const version = "1.6.0"
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -120,11 +123,45 @@ func serve(root string) int {
 	}
 	log.Printf("证书指纹: %s", pm.Fingerprint())
 
+	// 电脑主动推送到手机：手机端 2026-11 起默认不再轮询，改由电脑在剪贴板变化时推过去。
+	// 目标地址由手机通过 POST /api/peer 登记，这里只负责按登记结果投递。
+	relaySvc := relay.New(engine,
+		func() []relay.Target {
+			devices := pm.Devices()
+			targets := make([]relay.Target, 0, len(devices))
+			for _, d := range devices {
+				if d.Push == nil {
+					continue
+				}
+				targets = append(targets, relay.Target{
+					DeviceID:    d.ID,
+					Host:        d.Push.Host,
+					Port:        d.Push.Port,
+					Fingerprint: d.Push.Fingerprint,
+					Token:       d.Push.Token,
+				})
+			}
+			return targets
+		},
+		func() bool { return store.Get().Enabled },
+		func(deviceID string, ok bool, err error) {
+			// 失败要在状态接口里如实上报，手机才会退回轮询；成功则顺手点亮在线状态。
+			pm.SetPushFailed(deviceID, !ok)
+			if ok {
+				pm.Touch(deviceID)
+			}
+		},
+		log.Printf,
+	)
+	relaySvc.Start()
+	defer relaySvc.Stop()
+
 	mgr, err := server.New(server.Options{
 		Config:         store,
 		Engine:         engine,
 		Version:        version,
 		Pairing:        pm,
+		Relay:          relaySvc,
 		ApplyAutoStart: winutil.SetAutoStart,
 		Logf:           log.Printf,
 	})

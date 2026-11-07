@@ -84,6 +84,49 @@ type PairedDevice struct {
 	Note      string    `json:"note,omitempty"`
 	TokenHash string    `json:"token_hash"`
 	CreatedAt time.Time `json:"created_at"`
+	// Push 非空表示这台设备允许电脑主动推送（手机端 POST /api/peer 登记的结果）。
+	Push *PushTarget `json:"push,omitempty"`
+}
+
+// PushTarget 是手机反向注册的推送地址。
+//
+// 新版 CyIME 手机端（2026-11 起）默认不再每 2 秒轮询电脑，而是把自己的监听端口、
+// 证书指纹和一次性授权令牌交给电脑，由电脑在剪贴板变化时直接 PUT 过去。
+// 没有这条记录时手机退回旧版轮询，而旧轮询只在输入法键盘显示时生效，
+// 于是「复制了手机却没收到」在键盘收起时必然发生。
+type PushTarget struct {
+	// HostID 是手机自己报告的设备标识（仅用于排障，不参与寻址）。
+	HostID string `json:"host_id,omitempty"`
+	// Host 是手机在局域网里的地址：取它发起登记请求时的来源地址。
+	Host string `json:"host"`
+	// Port 是手机 DeviceHost 的监听端口（默认 18741）。
+	Port int `json:"port"`
+	// Fingerprint 是手机证书叶 DER 的 SHA-256 小写十六进制，用于固定信任。
+	Fingerprint string `json:"fingerprint"`
+	// Token 是手机发给电脑的 Bearer 令牌（43 字符 base64url）。
+	Token     string    `json:"token"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Valid 判断推送目标是否可用（地址/端口/指纹/令牌都在合理范围内）。
+func (p PushTarget) Valid() bool {
+	if p.Host == "" || p.Port < 1 || p.Port > 65535 {
+		return false
+	}
+	if len(p.Fingerprint) != 64 || len(p.Token) != 43 {
+		return false
+	}
+	for _, r := range p.Fingerprint {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	for _, r := range p.Token {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // Default 返回可直接使用的默认配置。
@@ -262,6 +305,11 @@ func normalize(c *Config) []string {
 	for _, d := range c.Devices {
 		if IsUUID(d.ID) && d.TokenHash != "" {
 			d.Note = NormalizeNote(d.Note)
+			// 推送目标来自网络输入：手改坏了就丢掉，别让推送循环一直拨一个不存在的地址。
+			if d.Push != nil && !d.Push.Valid() {
+				d.Push = nil
+				issues = append(issues, "已丢弃无效的推送地址")
+			}
 			kept = append(kept, d)
 		}
 	}

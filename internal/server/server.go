@@ -23,6 +23,7 @@ import (
 
 	"cyime-sync/internal/config"
 	"cyime-sync/internal/pairing"
+	"cyime-sync/internal/relay"
 	"cyime-sync/internal/syncer"
 )
 
@@ -33,6 +34,8 @@ type Options struct {
 	Version string
 	// Pairing 配对（自签证书 + 逐设备令牌）。必填：本版本不再支持无 TLS 的明文对接。
 	Pairing *pairing.Manager
+	// Relay 可选：电脑主动推送到手机。为 nil 时只保留手机端旧版轮询。
+	Relay *relay.Relay
 	// ApplyAutoStart 由 main 注入（写 HKCU Run 注册表）。
 	ApplyAutoStart func(bool) error
 	// Logf 可选日志钩子，默认写标准错误。
@@ -222,6 +225,7 @@ func (m *Manager) Handler() http.Handler {
 	mux.HandleFunc("/favicon.ico", m.serveAsset("icon-64.png", "image/png"))
 	mux.HandleFunc("/api/clipboard", m.handleClipboard)
 	mux.HandleFunc("/api/pair", m.handlePair)
+	mux.HandleFunc("/api/peer", m.handlePeer)
 	mux.HandleFunc("/api/pairing", m.handlePairSession)
 	mux.HandleFunc("/api/devices", m.handleDevices)
 	mux.HandleFunc("/api/settings", m.handleSettings)

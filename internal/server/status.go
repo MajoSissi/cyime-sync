@@ -62,14 +62,28 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 方向开关已取消（恒为双向），字段保留只为与手机端协议保持兼容。
-		writeJSON(w, http.StatusOK, map[string]any{
+		//
+		// push / push_pin / push_port / push_failed 是 2026-11 手机端新增的一组：
+		// 手机看到 push 为真就会 POST /api/peer 登记地址，之后不再每 2 秒轮询电脑，
+		// 改由电脑在剪贴板变化时推过去（键盘收起也能收到）。push_failed 为真时手机
+		// 退回旧版轮询，所以推送连续失败必须如实上报，不能让手机一直等。
+		view := map[string]any{
 			"v":               2,
 			"connected":       true,
 			"send_enabled":    true,
 			"receive_enabled": true,
 			"device_id":       dev.ID,
 			"server_name":     m.opts.Pairing.ServerName(),
-		})
+			"push":            true,
+			"push_pin":        nil,
+			"push_port":       nil,
+			"push_failed":     m.opts.Pairing.PushFailed(dev.ID),
+		}
+		if target, ok := m.opts.Pairing.PushTarget(dev.ID); ok {
+			view["push_pin"] = target.Fingerprint
+			view["push_port"] = target.Port
+		}
+		writeJSON(w, http.StatusOK, view)
 		return
 	}
 	writeJSON(w, http.StatusOK, m.statusView())

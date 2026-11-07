@@ -193,7 +193,14 @@
     pairing = next;
     const same =
       prev.length === list.length &&
-      prev.every((d, i) => d.id === list[i].id && d.name === list[i].name && d.note === list[i].note);
+      prev.every(
+        (d, i) =>
+          d.id === list[i].id &&
+          d.name === list[i].name &&
+          d.note === list[i].note &&
+          Boolean(d.push) === Boolean(list[i].push) &&
+          Boolean(d.push_failed) === Boolean(list[i].push_failed),
+      );
     if (!same) {
       renderPairing();
       return;
@@ -218,12 +225,18 @@
     const drift = (Date.now() - pairingAt) / 1000;
     for (const st of deviceStates.values()) {
       const idle = st.idle + drift;
-      const online = idle < ONLINE_WINDOW;
+      const idleOnline = idle < ONLINE_WINDOW;
+      const pushOnline = st.push && !st.pushFailed;
+      const online = idleOnline || pushOnline;
       if (st.online === online) continue;
       st.online = online;
       st.node.dataset.online = String(online);
       st.node.textContent = online ? '在线' : '离线';
-      st.node.title = online ? '手机正在与电脑同步' : idleTitle(idle);
+      st.node.title = online
+        ? pushOnline && !idleOnline
+          ? '已登记推送：电脑复制后会直接推给它'
+          : '手机正在与电脑同步'
+        : idleTitle(idle);
     }
   }
 
@@ -269,7 +282,15 @@
 
     const state = document.createElement('span');
     state.className = 'device__state';
-    deviceStates.set(dev.id, { node: state, idle: idleOf(dev), online: null });
+    // 登记过推送地址的设备不再每 2 秒发请求，光看「空闲秒数」会一直显示离线。
+    // 只要推送没被标记失败，就说明电脑能主动送到它，按已连接处理。
+    deviceStates.set(dev.id, {
+      node: state,
+      idle: idleOf(dev),
+      push: Boolean(dev.push),
+      pushFailed: Boolean(dev.push_failed),
+      online: null,
+    });
 
     row.append(deviceAvatar(), main, state, actions);
     return row;

@@ -90,6 +90,13 @@ func (m *Manager) clipboardPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 先登记来源再写缓存：推送器每 300ms 检查一次缓存，若在「写完缓存」与「登记来源」
+	// 之间插入，就会把这条内容原样推回给刚发来的那台手机。
+	if m.opts.Relay != nil {
+		_, hash := protocol.Digest(text)
+		m.opts.Relay.NoteInbound(dev.ID, hash)
+	}
+
 	if _, applyErr := m.opts.Engine.Apply(text, sourceOr(source, dev.Name)); applyErr != nil {
 		if errors.Is(applyErr, clipboard.ErrConflict) {
 			writeError(w, protocol.StatusConflict, protocol.CodeConflict, "写入前剪贴板已被其它程序改变")

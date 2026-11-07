@@ -1,18 +1,23 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"cyime-sync/internal/config"
 	"cyime-sync/internal/pairing"
 	"cyime-sync/internal/protocol"
+	"cyime-sync/internal/relay"
 )
 
 // TestSamePortServesPlainAndTLS 验证单一端口同时服务两类客户端：
@@ -104,4 +109,105 @@ func getStatus(t *testing.T, c *http.Client, url string) int {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
+}
+
+// TestPushReachesPhoneOnClipboardChange 串起整条主动推送链路：
+// 引擎缓存变化 → 推送器按登记目标 PUT → 手机确认 → 设备被点亮为在线。
+//
+// 手机端扮演服务端（DeviceHost 监听 18741），电脑是发起方，这与真实方向一致。
+func TestPushReachesPhoneOnClipboardChange(t *testing.T) {
+	env := newEnv(t, "第一段")
+
+	type hit struct {
+		text string
+		auth string
+	}
+	hits := make(chan hit, 4)
+	phone := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var in struct {
+			Text string `json:"text"`
+		}
+		_ = json.Unmarshal(body, &in)
+		hits <- hit{text: in.Text, auth: r.Header.Get("Authorization")}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"v":2}`))
+	}))
+	defer phone.Close()
+
+	const pushToken = "abcdefghijklmnopqrstuvwxyz0123456789-_ABCDEFG"
+	sum := sha256.Sum256(phone.Certificate().Raw)
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(phone.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deviceID := env.store.Get().Devices[0].ID
+	saved, err := env.pm.SetPushTarget(deviceID, config.PushTarget{
+		Host: host, Port: atoi(t, portText), Fingerprint: hex.EncodeToString(sum[:]),
+		Token: pushToken, UpdatedAt: time.Now(),
+	})
+	if err != nil || !saved {
+		t.Fatalf("登记推送目标失败: %v", err)
+	}
+
+	relaySvc := relay.New(env.engine,
+		func() []relay.Target {
+			var out []relay.Target
+			for _, d := range env.store.Get().Devices {
+				if d.Push == nil {
+					continue
+				}
+				out = append(out, relay.Target{DeviceID: d.ID, Host: d.Push.Host, Port: d.Push.Port,
+					Fingerprint: d.Push.Fingerprint, Token: d.Push.Token})
+			}
+			return out
+		},
+		func() bool { return env.store.Get().Enabled },
+		func(id string, ok bool, _ error) {
+			env.pm.SetPushFailed(id, !ok)
+			if ok {
+				env.pm.Touch(id)
+			}
+		}, nil)
+	relaySvc.Start()
+	defer relaySvc.Stop()
+
+	// 模拟用户在电脑上复制了新内容。
+	if _, err := env.clip.Write("第二段内容", env.clip.Sequence()); err != nil {
+		t.Fatalf("写入剪贴板失败: %v", err)
+	}
+	env.engine.Refresh()
+
+	select {
+	case got := <-hits:
+		if got.text != "第二段内容" {
+			t.Fatalf("推送内容不对: %q", got.text)
+		}
+		if got.auth != "Bearer "+pushToken {
+			t.Fatalf("推送应带手机发放的令牌，实际 %q", got.auth)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待手机收到推送超时")
+	}
+
+	// 推送成功也算一次可达：设备列表不能因此显示离线。
+	if _, ok := env.pm.LastSeen(deviceID); !ok {
+		t.Fatal("推送成功后应刷新设备在线状态")
+	}
+	if env.pm.PushFailed(deviceID) {
+		t.Fatal("推送成功后不应保留失败标记")
+	}
+}
+
+func atoi(t *testing.T, s string) int {
+	t.Helper()
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			t.Fatalf("端口格式不对: %q", s)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

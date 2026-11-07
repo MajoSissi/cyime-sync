@@ -847,3 +847,121 @@ func TestForcePushThenPullServesContent(t *testing.T) {
 		t.Fatalf("重算不应撤下刚强推的内容，实际 %d", rec.Code)
 	}
 }
+
+// 手机端 2026-11 起不再每 2 秒轮询：先看 /api/status 里的 push，再 POST /api/peer 登记
+// 自己的监听地址。这里锁住三点：登记能存下来、状态接口如实回显、失败标记能上报。
+func TestPeerRegistrationDrivesPushStatus(t *testing.T) {
+	env := newEnv(t, "内容")
+	srv := httptest.NewTLSServer(env.mgr.Handler())
+	defer srv.Close()
+	client := srv.Client()
+
+	fp := strings.Repeat("a1", 32)
+	pushToken := strings.Repeat("A", 43)
+	body := fmt.Sprintf(`{"v":2,"id":"11111111-1111-4111-8111-111111111111",`+
+		`"client_id":"6f1f3f9e-5f0b-4a1e-9c7d-0b8f2f4d3a11","name":"测试手机",`+
+		`"port":18741,"fingerprint":%q,"token":%q}`, fp, pushToken)
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/peer", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+env.token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("登记推送地址失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("登记应返回 200，实际 %d", resp.StatusCode)
+	}
+
+	stored := env.store.Get().Devices
+	if len(stored) != 1 || stored[0].Push == nil {
+		t.Fatalf("推送地址未落盘: %+v", stored)
+	}
+	if stored[0].Push.Host != "127.0.0.1" || stored[0].Push.Port != 18741 {
+		t.Fatalf("推送地址应取请求来源 + 手机上报端口: %+v", stored[0].Push)
+	}
+
+	status := statusWithToken(t, client, srv.URL, env.token)
+	if status["push"] != true {
+		t.Fatalf("状态应声明支持推送: %+v", status)
+	}
+	if status["push_pin"] != fp || status["push_port"] != float64(18741) {
+		t.Fatalf("状态应回显登记信息，手机据此判断不必重登: %+v", status)
+	}
+	if status["push_failed"] != false {
+		t.Fatalf("刚登记不应标记失败: %+v", status)
+	}
+
+	// 连续失败后手机要靠这个标记退回轮询，不能静默。
+	env.pm.SetPushFailed(stored[0].ID, true)
+	status = statusWithToken(t, client, srv.URL, env.token)
+	if status["push_failed"] != true {
+		t.Fatalf("推送失败应上报: %+v", status)
+	}
+
+	// 登记请求带令牌，明文传输等于把令牌广播出去。
+	plain := httptest.NewServer(env.mgr.Handler())
+	defer plain.Close()
+	req, _ = http.NewRequest(http.MethodPost, plain.URL+"/api/peer", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+env.token)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("明文登记应被拒绝，实际 %d", resp2.StatusCode)
+	}
+}
+
+// 非法字段不能写进配置：地址/端口/指纹/令牌任何一项不合规都会让推送一直空转。
+func TestPeerRegistrationRejectsBadFields(t *testing.T) {
+	env := newEnv(t, "内容")
+	srv := httptest.NewTLSServer(env.mgr.Handler())
+	defer srv.Close()
+
+	cases := []string{
+		`{"v":1,"port":18741,"fingerprint":"` + strings.Repeat("a1", 32) + `","token":"` + strings.Repeat("A", 43) + `"}`,
+		`{"v":2,"port":0,"fingerprint":"` + strings.Repeat("a1", 32) + `","token":"` + strings.Repeat("A", 43) + `"}`,
+		`{"v":2,"port":18741,"fingerprint":"short","token":"` + strings.Repeat("A", 43) + `"}`,
+		`{"v":2,"port":18741,"fingerprint":"` + strings.Repeat("a1", 32) + `","token":"short"}`,
+	}
+	for i, body := range cases {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/peer", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+env.token)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("用例 %d 请求失败: %v", i, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("用例 %d 应返回 400，实际 %d", i, resp.StatusCode)
+		}
+	}
+	if got := env.store.Get().Devices; len(got) != 1 || got[0].Push != nil {
+		t.Fatalf("非法登记不应落盘: %+v", got)
+	}
+}
+
+// statusWithToken 拉一次带 Bearer 的状态，返回解码后的 map。
+func statusWithToken(t *testing.T, client *http.Client, base, token string) map[string]any {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, base+"/api/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("读取状态失败: %v", err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("状态不是合法 JSON: %v", err)
+	}
+	return out
+}

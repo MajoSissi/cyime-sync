@@ -40,7 +40,8 @@ internal/clipboard/  // Win32 剪贴板读写（序列号、重试、UTF-8/UTF-1
 internal/protocol/   // profile 编解码、校验、ETag、错误码映射
 internal/pairing/    // 配对：自签证书、限时窗口、逐设备令牌、紧凑二维码编码
 internal/syncer/     // 双向同步引擎：变化检测、去重、冲突、事件流
-internal/server/     // /api/clipboard、/api/settings、/api/status、SSE
+internal/relay/      // 反向推送：按手机登记的地址把缓存内容 PUT 过去（设备互推新协议）
+internal/server/     // /api/clipboard、/api/settings、/api/status、/api/peer、SSE
 internal/tray/       // 窗口类、消息循环、托盘图标、菜单
 internal/winutil/    // 懒加载 Win32 绑定、DPI、自启动、本机地址
 web/                 // 静态页面（go:embed），index.html + md3.css + app.js + icon-64/180.png
@@ -131,14 +132,32 @@ ETag：对文本内容计算（内容哈希的引号包裹形式，如 `"<sha256
 
 协议层的其它硬要求：
 
-- 手机端每约 2 秒 GET 一次，`GET` 必须廉价且幂等：不得因 GET 修改剪贴板、不得刷新 ETag、不得记录正文。
+- 旧版手机端每约 2 秒 GET 一次，`GET` 必须廉价且幂等：不得因 GET 修改剪贴板、不得刷新 ETag、不得记录正文。新版手机端默认不再轮询，改为下文的反向推送；两条路径必须同时可用。
 - 手机端会重复 PUT 同一条内容（退避重试）：内容与当前剪贴板相同必须视为成功并返回 200，不重复写剪贴板。
+- 手机端 PUT 会多带 `stamp`（多设备互推的顺序号）：必须忽略该字段，校验只看 `type/text/size/hash/has_data/data_name`。电脑端发出的 profile **不得**携带 `stamp`——缺失时手机按「最新」处理，带上电脑时钟反而可能因为两端时钟差被判成旧内容而丢弃。
 - 不做跨设备时间顺序判断，不尝试"哪边更新"合并；不传历史记录、图片、文件、HTML。
-- `GET /api/status`（带 Bearer）→ `200 {"v":2,"connected":true,"send_enabled":true,"receive_enabled":true,"device_id","server_name"}`；令牌无效 `401`。方向开关已取消，`send_enabled`/`receive_enabled` 恒为 `true`，字段保留只为与手机端既有解析逻辑兼容。不带 Bearer 时返回本机设置页用的运行状态，两者都不含秘密。
+- `GET /api/status`（带 Bearer）→ `200 {"v":2,"connected":true,"send_enabled":true,"receive_enabled":true,"device_id","server_name","push":true,"push_pin","push_port","push_failed"}`；令牌无效 `401`。方向开关已取消，`send_enabled`/`receive_enabled` 恒为 `true`，字段保留只为与手机端既有解析逻辑兼容。不带 Bearer 时返回本机设置页用的运行状态，两者都不含秘密。
+  - `push` 恒为 `true`：手机看到后走 `POST /api/peer` 登记地址并停掉轮询。没有这条，手机会退回「只在键盘显示时每 2 秒拉一次」，键盘收起期间电脑复制的内容必然收不到。
+  - `push_pin` / `push_port` 回显已登记的手机证书指纹与监听端口；与手机手上的值一致时它不会重复登记。未登记时返回 `null`（手机端读到 0/空串，触发登记）。
+  - `push_failed` 为真时手机退回轮询。推送连续失败必须如实上报，否则手机会一直等一个到不了的推送。
+
+### 3.3 反向推送（电脑 → 手机）
+
+新版手机端（CyIME 2026-11 起）把「允许其他设备连接本机」与剪贴板同步绑定：只要同步开着，它就在 `18741` 上监听 TLS，接受已授权设备的写入。电脑端据此主动推，是主路径；旧版轮询只是兜底。
+
+- `POST /api/peer`（仅 TLS，带 Bearer）请求体 `{"v":2,"id","client_id","name","port","fingerprint","token"}`，成功 `200 {"v":2,"push":true}`。字段校验与手机端 `WindowsPairingProtocol.registration` 一致：`id` 为 UUID、`port` 1–65535、`fingerprint` 64 位小写十六进制、`token` 43 字符 base64url。
+- 登记只写进**当前认证设备**名下（`config.PairedDevice.Push`），请求体里的 `client_id` 不参与寻址：否则一台已配对设备可以把他人的推送劫持到别处。明文请求一律 `400`。
+- 推送地址的 host 取登记请求的来源 IP（手机不报自己的 IP），端口与指纹、令牌由手机给出。手机换 IP 后会重新登记；登记失败/过期由 `push_failed` 兜底。
+- 推送用一个独立的 `http.Client`：`Proxy=nil`（局域网直连，不进系统代理）、禁用 HTTP/2、`InsecureSkipVerify` + `VerifyPeerCertificate` 比对叶证书 SHA-256（手机证书自签且无合法主机名，只能按指纹固定）。
+- 请求体与 `GET /api/clipboard` 同构（由 `protocol.BuildProfile` 重算 size/hash），`Authorization: Bearer <手机发放的 token>`。超时 6 秒，失败按 0s/2s/8s 重试三次，仍失败则回写 `push_failed`。
+- 只推缓存里的内容：能进缓存说明已过敏感内容与字符上限判定，推送不得另写一套策略；内容超 64 KiB 时手机端同样拒收。
+- 手机自己 PUT 上来的内容不再回推给**来源设备**（其余设备照推，用于「两台手机只与电脑配对」的拓扑）。来源必须在写缓存**之前**登记，否则 300ms 的检查可能插在中间、把内容原样推回去，把对方刚复制的新内容盖掉。
+- 推送成功即视为一次可达：刷新设备在线状态（`LastSeen`）。推送模式下手机会话不再每 2 秒发请求，只靠推送与「亮屏后第一次开键盘」的状态检查点亮，不能因此显示成离线。
+
 
 ## 4. 同步引擎行为约束
 
-- 变化检测用 `GetClipboardSequenceNumber`，不做轮询读全文；序列号变化才 `OpenClipboard` 读内容。轮询间隔 `syncer.PollInterval` = **150ms**（一次轮询只是读一个计数器，成本可忽略）。安卓端约 2 秒 GET 一次，所以端到端最坏约 2.2 秒，典型 1–2 秒。
+- 变化检测用 `GetClipboardSequenceNumber`，不做轮询读全文；序列号变化才 `OpenClipboard` 读内容。轮询间隔 `syncer.PollInterval` = **150ms**（一次轮询只是读一个计数器，成本可忽略）。之后走哪条路取决于手机：新版由 `internal/relay` 直接推送（通常 <0.5 秒，键盘收起也生效），旧版靠手机每约 2 秒 GET 一次（只在键盘显示时）。
 - 文本兼容 `CF_UNICODETEXT` 与 `CF_TEXT`：少数老程序/终端只写 ANSI，必须按系统代码页（`CP_ACP`）回转；否则现象是「复制了却不同步」且没有任何事件可查。两者都没有才算 `KindNonText`。
 - 读取失败不得静默：记一条 `busy` 事件（同一序列号 5 秒内最多一条），**保持上一份缓存**（不能返回 204 把手机 ETag 清掉），下一轮自动重试。
 - 读写剪贴板必须带重试（`OpenClipboard` 失败按 ~10–30ms 间隔重试，总预算 ≤ 500ms），重试耗尽返回 `503`。

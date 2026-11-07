@@ -19,6 +19,10 @@ type deviceView struct {
 	// IdleSeconds 是距上次设备请求过去的秒数；-1 表示这次进程启动后还没连过。
 	// 是否算"在线"由设置页按 pairing.OnlineWindow 判断，服务端只给客观数据。
 	IdleSeconds int `json:"idle_seconds"`
+	// Push 表示这台设备已登记推送地址：电脑复制后会直接推给它，不再等它来拉。
+	Push bool `json:"push"`
+	// PushFailed 表示最近一次主动推送没送到；手机端看到后也会退回轮询。
+	PushFailed bool `json:"push_failed"`
 }
 
 // pairingView 是设置页轮询的配对状态。
@@ -53,6 +57,8 @@ func (m *Manager) pairingState() pairingView {
 			Note:        d.Note,
 			CreatedAt:   d.CreatedAt,
 			IdleSeconds: idle,
+			Push:        d.Push != nil,
+			PushFailed:  pm.PushFailed(d.ID),
 		})
 	}
 	return v
